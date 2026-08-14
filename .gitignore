@@ -1,0 +1,35 @@
+# ===== Python 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== Python 缓存 / 编译产物 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===== 打包 / 分发 =====
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== 大数据原始数据（不提交 200 万条住院记录）=====
+data/
+*.tsv
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== 日志 =====
+*.log
+logs/
+
+# ===== 系统 / IDE =====
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

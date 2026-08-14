@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/代码实现/P2_数据预处理",
+    "${workspaceFolder}/代码实现/P3_分析服务",
+    "${workspaceFolder}/代码实现/P4_AI交互"
+  ]
+}
