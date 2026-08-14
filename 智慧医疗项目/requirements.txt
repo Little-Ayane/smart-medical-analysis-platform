@@ -1,14 +1,16 @@
 # 智慧医疗大数据与AI大模型分析平台 —— Python 依赖清单
-# 适用 Python：3.11（建议 >=3.10, <3.13）
-# 环境：由 python3.11 创建的 .venv 虚拟环境
+# 适用 Python：3.11（精确匹配项目环境清单）
 
-# ===== 核心依赖（代码中实际 import）=====
-numpy==2.4.6
-pandas==2.3.3
-PyMySQL==1.2.0
-Flask==3.1.3
-requests==2.34.2
+# ===== 核心依赖（精确版本）=====
+numpy==1.26.4            # 兼容 pandas 2.0.3（numpy 2.x 与 pandas<2.2 不兼容）
+pandas==2.0.3
+PyMySQL==1.1.0
+Flask==3.0.3
+requests==2.34.2         # P4 agent.py 调用分析 API 使用
 
-# ===== 二期可选（当前代码未实际 import，按需取消注释安装）=====
-# redis==5.2.1        # P3 分析服务缓存（二期）
-# langchain==0.3.26   # P4 AI Agent（二期，当前为规则模板兜底）
+# ===== 大数据 / 缓存 / AI =====
+pyspark==3.5.4           # 对应 Spark 3.5.4-bin-hadoop3
+redis==5.0.8             # redis-py，P3 二期缓存
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-openai==0.1.25
