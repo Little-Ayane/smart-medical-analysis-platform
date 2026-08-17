@@ -223,10 +223,10 @@ ORDER BY cases DESC;
 ---
 
 ## 数据规模
-
+#
 | 表 | 行数 |
 |----|------|
-| fact_discharge | 2,100,546 |
+| fact_discharge | 2,021,253 |
 | dim_hospital | 206 |
 | dim_patient | 5,301 |
 | dim_diagnosis | 478 |
@@ -236,6 +236,8 @@ ORDER BY cases DESC;
 | dim_time | 1 |
 
 ---
+数据已严格清洗：移除 Gender='U'（156行）、医院ID/邮编缺失（45,093行）、诊断编码缺失（1,588行）、完全重复记录（32,612行）。性别字段仅含 M/F。
+
 
 ## 原始宽表（ODS 层）
 
