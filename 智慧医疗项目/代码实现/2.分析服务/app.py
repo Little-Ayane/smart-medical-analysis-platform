@@ -2,8 +2,10 @@
 """
 P3 · 大数据分析服务模块
 功能：多维度聚合分析 + RESTful API 封装，统一 JSON 信封返回
-技术：Flask / PyMySQL / Redis（缓存）
+业务模块：病种与手术分析（disease.py）、支付分析（payment.py）、维度字典（meta.py）
+技术：Flask / PyMySQL / 进程内 TTL 缓存
 运行：python app.py  ->  http://127.0.0.1:5000
+注意：进程内缓存依赖单进程模型，请勿用 debug=True（reloader 双进程会让缓存各自为政）。
 """
 import json
 import time
@@ -11,8 +13,43 @@ from functools import wraps
 
 import pymysql
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
+
+from common import apply_json_provider
+from meta import meta_bp
+from modules.disease import disease_bp
+from modules.payment import payment_bp
 
 app = Flask(__name__)
+apply_json_provider(app)
+app.register_blueprint(disease_bp)
+app.register_blueprint(payment_bp)
+app.register_blueprint(meta_bp)
+
+
+# ------------------------------------------------------------
+# CORS（前端跨域直连，无需 flask-cors）
+# ------------------------------------------------------------
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+# ------------------------------------------------------------
+# 全局异常兜底（统一信封，不抛裸异常）
+# ------------------------------------------------------------
+@app.errorhandler(HTTPException)
+def on_http_exception(e):
+    return error(e.code if e.code < 500 else 500, e.name)
+
+
+@app.errorhandler(Exception)
+def on_unhandled(e):
+    app.logger.exception("未处理异常: %s", request.path)
+    return error(500, "服务内部错误")
 
 # ------------------------------------------------------------
 # 数据库连接
@@ -190,4 +227,4 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
