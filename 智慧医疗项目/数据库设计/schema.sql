@@ -89,7 +89,7 @@ CREATE TABLE fact_inpatient_discharge (
     -- 病情相关
     apr_severity_code            TINYINT       DEFAULT NULL COMMENT '病情严重程度代码',
     apr_severity_desc            VARCHAR(64)   DEFAULT NULL COMMENT '病情严重程度描述',
-    apr_risk_mortality           TINYINT       DEFAULT NULL COMMENT '死亡风险等级',
+    apr_risk_mortality           VARCHAR(32)   DEFAULT NULL COMMENT '死亡风险描述(Minor/Moderate/Major/Extreme，源数据无数字代码)',
     apr_medical_surgical         VARCHAR(32)   DEFAULT NULL COMMENT '内科/外科分类',
 
     -- 支付信息
@@ -114,7 +114,11 @@ CREATE TABLE fact_inpatient_discharge (
     KEY idx_age_group    (age_group),
     KEY idx_diag_code    (diagnosis_id, discharge_year),
     KEY idx_payment      (payment_typology_1),
-    KEY idx_severity     (apr_severity_code)
+    KEY idx_severity     (apr_severity_code),
+    -- 病种手术/支付分析模块新增（2026-08-17）：
+    --   支付交叉与桑葚图（pay1×pay2）、人口金字塔（age×gender）覆盖索引，禁止前缀索引（不能服务 GROUP BY）
+    KEY idx_pay1_pay2    (payment_typology_1, payment_typology_2),
+    KEY idx_age_gender   (age_group, gender)
 ) ENGINE=InnoDB COMMENT='住院患者出院记录事实表（200万+条）';
 
 -- ============================================================
