@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------
 # 1. 大数据批量读取（分块读取，避免内存溢出）
 # ------------------------------------------------------------
-def load_in_chunks(path: str, sep: str = "\t", chunksize: int = 100_000):
+def load_in_chunks(path: str, sep: str = ",", chunksize: int = 100_000):
     """按块读取 TSV/CSV，逐块 yield，解决大文件卡顿与内存溢出。"""
     logger.info("开始分块读取: %s (chunksize=%d)", path, chunksize)
     dtype = {
@@ -32,9 +32,13 @@ def load_in_chunks(path: str, sep: str = "\t", chunksize: int = 100_000):
         "CCSR Diagnosis Code": "string", "CCSR Procedure Code": "string",
         "APR DRG Code": "string", "APR MDC Code": "string",
         "Emergency Department Indicator": "string",
-        "Discharge Year": "Int32", "Length of Stay": "Int32",
-        "Birth Weight": "Int32", "APR Severity of Illness Code": "Int32",
-        "APR Risk of Mortality": "Int32",
+        # 数值类字段统一按 string 读入，交给 standardize() 再转数值，原因是：
+        #   ① Length of Stay 存在 "120 +" 封顶值（住院 >=120 天），强制 Int32 会读崩；
+        #   ② APR Risk of Mortality 实为描述文本（Minor/Moderate/Major/Extreme），非数字代码。
+        # 若在读取阶段就强制 Int32，会抛 "Unable to parse string" 直接崩溃。
+        "Discharge Year": "string", "Length of Stay": "string",
+        "Birth Weight": "string", "APR Severity of Illness Code": "string",
+        "APR Risk of Mortality": "string",
     }
     for i, chunk in enumerate(pd.read_csv(path, sep=sep, dtype=dtype,
                                           low_memory=False, chunksize=chunksize)):
@@ -70,6 +74,12 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------------------------------------
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
     """统一格式与类型。"""
+    # ① 住院天数封顶值归一：SPARCS 对 >=120 天记为 "120 +"，统一转成 120 再转数值
+    if "Length of Stay" in df.columns:
+        df["Length of Stay"] = (df["Length of Stay"].astype("string")
+                                .str.strip()
+                                .str.replace(r"\s*\+\s*$", "", regex=True))
+
     for col in ["Total Charges", "Total Costs"]:
         if col in df.columns:
             df[col] = (df[col].astype(str)
@@ -77,8 +87,10 @@ def standardize(df: pd.DataFrame) -> pd.DataFrame:
                        .str.replace("$", "", regex=False))
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # ② 注意：不再把 "APR Risk of Mortality" 纳入数值列——该列实为描述文本
+    #    （Minor/Moderate/Major/Extreme），强转数值会静默置空整列。
     int_cols = ["Length of Stay", "Discharge Year", "Birth Weight",
-                "APR Severity of Illness Code", "APR Risk of Mortality"]
+                "APR Severity of Illness Code"]
     for col in int_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int32")
@@ -236,7 +248,9 @@ def upsert_dimension(conn, df: pd.DataFrame, dim_name: str, cache: dict) -> dict
                f"VALUES ({', '.join(['%s'] * len(db_cols))})")
         for _, row in dim_df.iterrows():
             key = tuple(_norm(row[c]) for c in key_cols)
-            if key in cache:
+            # 自然键含空的维度行（如"无手术"记录的空 CCSR Procedure Code）不写维度表，
+            # 对应事实行经 cache.get() 映射为 NULL 外键，与 schema 的 DEFAULT NULL 一致
+            if key in cache or any(k is None for k in key):
                 continue
             values = [_norm(row[c]) for c in mapping.keys()]
             cur.execute(sql, values)
@@ -300,12 +314,14 @@ def load_chunk(conn, df: pd.DataFrame, caches: dict) -> int:
 # ------------------------------------------------------------
 def connect_mysql(host="127.0.0.1", user="root", password="", db="smart_health"):
     return pymysql.connect(host=host, user=user, password=password,
-                           database=db, charset="utf8mb4")
+                           database=db, charset="utf8mb4",
+                           cursorclass=pymysql.cursors.DictCursor)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="原始 TSV/CSV 文件路径")
+    parser.add_argument("--sep", default=",", help="分隔符，CSV 用 \",\"，TSV 用 \"\\t\"")
     parser.add_argument("--db", default="smart_health")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--user", default="root")
@@ -316,7 +332,7 @@ def main():
     caches = init_dim_caches(conn)
 
     total = 0
-    for chunk in load_in_chunks(args.input):
+    for chunk in load_in_chunks(args.input, sep=args.sep):
         chunk = clean_data(chunk)          # 异常处理 + 去重
         chunk = standardize(chunk)         # 类型标准化
         total += load_chunk(conn, chunk, caches)
