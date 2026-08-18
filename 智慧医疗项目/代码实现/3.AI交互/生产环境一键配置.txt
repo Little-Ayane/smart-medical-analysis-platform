@@ -1,0 +1,21 @@
+bash
+# Windows PowerShell
+$env:FLASK_DEBUG="0"
+$env:CORS_ORIGINS="https://hospital.yourdomain.com,http://localhost:3000"
+
+$env:SESSION_BACKEND="redis"
+$env:REDIS_URL="redis://:redis_password@10.0.0.12:6379/3"
+$env:SESSION_TTL_SECONDS="7200"
+
+$env:LLM_API_KEY="（从系统环境变量 / Kubernetes Secret 注入，不要写死在这里！例：sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 删除本行示例注释再使用）"
+$env:LLM_MODEL_ID="Qwen/Qwen2.5-72B-Instruct"
+$env:LLM_MODEL_ID_SMALL="Qwen/Qwen2.5-7B-Instruct"
+$env:LLM_TIMEOUT="45"
+
+$env:INTENT_CACHE_ENABLED="1"
+$env:INTENT_CACHE_TTL_SECONDS="600"
+
+$env:ASYNC_REPORT_WORKERS="8"
+$env:P4_PORT="5001"
+
+python agent.py

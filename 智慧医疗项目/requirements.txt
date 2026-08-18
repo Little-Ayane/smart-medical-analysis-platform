@@ -6,6 +6,7 @@ numpy==1.26.4            # 兼容 pandas 2.0.3（numpy 2.x 与 pandas<2.2 不兼
 pandas==2.0.3
 PyMySQL==1.1.0
 Flask==3.0.3
+Flask-Cors==4.0.1        # P4 agent.py 前端跨域调用需要
 requests==2.34.2         # P4 agent.py 调用分析 API 使用
 
 # ===== 大数据 / 缓存 / AI =====
