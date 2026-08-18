@@ -1,0 +1,24 @@
+# Web框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# 数据库
+pymysql==1.1.0
+sqlalchemy==2.0.25
+redis==5.0.1
+cryptography==41.0.7
+
+# 数据处理
+pandas==2.1.4
+numpy==1.26.2
+
+# 工具
+python-dotenv==1.0.0
+loguru==0.7.2
+python-multipart==0.0.6
+
+# 测试
+pytest==7.4.4
+pytest-asyncio==0.23.3
+httpx==0.26.0
