@@ -18,7 +18,7 @@ app = Flask(__name__)
 # 数据库连接
 # ------------------------------------------------------------
 def get_conn():
-    return pymysql.connect(host="127.0.0.1", user="root", password="",
+    return pymysql.connect(host="127.0.0.1", user="root", password="Csu@Boy727620zy",
                            database="smart_health", charset="utf8mb4",
                            cursorclass=pymysql.cursors.DictCursor)
 
@@ -188,6 +188,9 @@ def health():
         db_status = "error"
     return jsonify(envelope({"status": "ok", "db": db_status}, query_ms=1))
 
+# ===== 注册骆志远的路由 =====
+from luo_routes import register_luo_routes
+register_luo_routes(app)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
