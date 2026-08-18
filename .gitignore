@@ -33,3 +33,4 @@ logs/
 Thumbs.db
 .idea/
 *.swp
+sql/star_schema_dump.sql
