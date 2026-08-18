@@ -8,8 +8,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from mysql_dao import mysql_dao
-from sql_builder import sql_builder, QueryConfig, DIMENSION_MAP, METRIC_MAP
+from src.dao.mysql_dao import mysql_dao
+from src.query.sql_builder import sql_builder, QueryConfig, DIMENSION_MAP, METRIC_MAP
 
 
 class DRGService:
