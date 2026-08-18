@@ -1,29 +1,32 @@
-# ===== Python 虚拟环境 =====
-.venv/
-venv/
-env/
-ENV/
-
-# ===== Python 缓存 / 编译产物 =====
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# ===== 打包 / 分发 =====
+.Python
 build/
+develop-eggs/
 dist/
-*.egg-info/
+downloads/
+eggs/
 .eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# ===== 大数据原始数据（不提交 200 万条住院记录）=====
-data/
-*.tsv
-*.csv
-*.db
-*.sqlite
-*.sqlite3
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
 
+<<<<<<< Updated upstream
 # ===== 环境变量 / 密钥（绝对禁止提交真实 Key） =====
 # P4 AI 交互模块：本地 .env / .env.local 等都不提交，
 # 仅保留 .env.production（不含真实密钥的模板）与 .env.example
@@ -41,10 +44,33 @@ data/
 
 # ===== 日志 =====
 *.log
-logs/
-
-# ===== 系统 / IDE =====
-.DS_Store
-Thumbs.db
+=======
+# IDE
+.vscode/
 .idea/
 *.swp
+*.swo
+*~
+
+# Logs
+>>>>>>> Stashed changes
+logs/
+*.log
+
+# Data files
+*.csv
+*.sql
+!scripts/*.sql
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary
+tmp/
+temp/
