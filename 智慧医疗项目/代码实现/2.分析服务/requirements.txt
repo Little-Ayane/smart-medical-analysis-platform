@@ -1,0 +1,4 @@
+# P3 分析服务依赖（智慧医疗项目/.venv 已安装）
+flask>=3.0
+pymysql>=2.0
+requests>=2.31
