@@ -5,13 +5,16 @@ P3 · 大数据分析服务模块
 技术：Flask / PyMySQL / Redis（缓存）
 运行：python app.py  ->  http://127.0.0.1:5000
 """
+
 import json
 import time
 from functools import wraps
 
 import pymysql
 from flask import Flask, jsonify, request
-
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app)  # ← 加这一行，允许所有来源跨域
 app = Flask(__name__)
 
 # ------------------------------------------------------------
