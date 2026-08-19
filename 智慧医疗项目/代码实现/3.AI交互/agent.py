@@ -115,6 +115,8 @@ LLM_SMALL_ENABLED = LLM_ENABLED and bool(LLM_MODEL_ID_SMALL)
 # 意图解析缓存：避免完全相同的问题 + 相同上下文重复打 LLM
 INTENT_CACHE_ENABLED = os.getenv("INTENT_CACHE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 INTENT_CACHE_TTL_SECONDS = int(os.getenv("INTENT_CACHE_TTL_SECONDS", str(10 * 60)))  # 默认 10 分钟
+# 缓存版本号：升级路由表/字段后递增（如 v2_charts），强制旧 hash key 失效，避免脏缓存
+INTENT_CACHE_VERSION = os.getenv("INTENT_CACHE_VERSION", "v2_charts")
 
 # 推荐模型（硅基流动）：
 #   - 大模型（推荐，质量高）：Qwen/Qwen2.5-72B-Instruct / deepseek-ai/DeepSeek-V2-Chat
@@ -293,6 +295,7 @@ DIMENSION_KEYWORDS = {
     "性别": "gender", "男女": "gender",
     "年份": "discharge_year", "年": "discharge_year", "历年": "discharge_year", "近年": "discharge_year",
     "疾病": "ccsr_diagnosis", "诊断": "ccsr_diagnosis", "病种": "ccsr_diagnosis",
+    "手术": "procedure", "术式": "procedure", "手术方式": "procedure", "手术类型": "procedure",
     "医院": "facility", "机构": "facility", "医疗机构": "facility",
     "支付": "payment_typology", "支付方式": "payment_typology", "医保": "payment_typology",
     "严重程度": "severity", "病情": "severity",
@@ -308,6 +311,85 @@ METRIC_KEYWORDS = {
     "人数": "count", "数量": "count", "多少": "count", "几个人": "count",
     "占比": "payment_mix", "支付方式": "payment_mix", "分布": "payment_mix",
     "趋势": "trend", "变化": "trend", "走势": "trend",
+}
+
+# P3 新版接口图表类型关键词（命中后设 intent["chart_hint"]，走新版 14 接口路由）
+# 只收"明确暗示新图表"的词，不收"占比""趋势"等通用词（避免与旧 payment_mix/trend 冲突）
+CHART_HINT_KEYWORDS = {
+    # —— 病重趋势 / 堆叠柱 ——
+    "病重趋势": "severity_profile", "严重程度构成": "severity_profile",
+    "病重分布": "severity_profile", "堆叠图": "severity_profile",
+    "严重程度": "severity_profile",
+    # —— 人群差异 / 分组柱 ——
+    "人群差异": "population_diff", "性别差异": "population_diff",
+    "年龄差异": "population_diff", "种族差异": "population_diff",
+    # —— 人口金字塔 ——
+    "人口金字塔": "pyramid", "金字塔": "pyramid",
+    "性别年龄": "pyramid",
+    # —— 热力图 / 通用二维交叉（支付交叉走 payment_cross，不在这里）——
+    "热力图": "heatmap", "热图": "heatmap", "交叉表": "heatmap",
+    # —— 支付构成（新接口；与旧 payment_mix 区分）——
+    "支付构成": "payment_composition", "三层支付": "payment_composition",
+    "一级支付": "payment_composition", "二级支付": "payment_composition",
+    "三级支付": "payment_composition", "支付层级": "payment_composition",
+    # —— 桑葚图 ——
+    "桑葚图": "sankey", "桑基图": "sankey", "流向图": "sankey",
+    "资金流向": "sankey", "支付流向": "sankey", "支付链路": "sankey",
+    # —— 费用关系 / 散点图 ——
+    "费用关系": "cost_relation", "成本对比": "cost_relation",
+    "费用散点": "cost_relation", "散点图": "cost_relation", "成本费用": "cost_relation",
+    # —— 地区差异 / 区域分布 ——
+    "地区差异": "region_diff", "区域差异": "region_diff", "地区分布": "region_diff",
+    "区域分布": "region_diff", "医院分布": "region_diff", "地理分布": "region_diff",
+    "服务区": "region_diff", "服务区域": "region_diff", "各县": "region_diff",
+    # —— 支付交叉（含"支付"+"交叉"的复合表达）——
+    "支付交叉": "payment_cross", "支付×年龄": "payment_cross",
+    "支付与年龄": "payment_cross", "支付与病种": "payment_cross",
+    "支付与严重": "payment_cross", "支付与病情": "payment_cross",
+    "支付×病种": "payment_cross", "支付×严重": "payment_cross",
+    "支付方式交叉": "payment_cross", "支付交叉分析": "payment_cross",
+    # —— 自付负担 ——
+    "自付": "oop_burden", "自费": "oop_burden", "自付负担": "oop_burden",
+    "自费负担": "oop_burden", "out of pocket": "oop_burden", "out-of-pocket": "oop_burden",
+    # —— KPI 总览 ——
+    "总览": "payment_summary", "大屏": "payment_summary", "概览": "payment_summary",
+    "kpi": "payment_summary", "KPI": "payment_summary", "全量统计": "payment_summary",
+    "总体情况": "payment_summary", "整体情况": "payment_summary",
+    # —— 诊断排行 / 手术排行（替代旧 /analysis/aggregate，返回 code+name）——
+    "诊断排行": "top_diagnoses", "疾病排行": "top_diagnoses", "诊断top": "top_diagnoses",
+    "疾病top": "top_diagnoses", "常见疾病": "top_diagnoses", "高发疾病": "top_diagnoses",
+    "手术排行": "top_procedures", "手术top": "top_procedures",
+    "常见手术": "top_procedures", "高频手术": "top_procedures", "手术谱": "top_procedures",
+}
+
+# P4 metric → P3 新接口 metric 翻译表（解决命名差异：P4 用 avg_length_of_stay，P3 新接口用 avg_los）
+# None 表示该指标新接口不支持，降级为 count
+METRIC_TO_P3 = {
+    "count": "count",
+    "avg_length_of_stay": "avg_los",
+    "total_charges": "total_charges",
+    "avg_charges": "avg_charges",
+    "total_costs": None,
+    "avg_costs": None,
+    "payment_mix": "count",
+    "trend": "count",
+}
+
+# P4 dimension → P3 新接口 by/dim1/dim2 翻译表
+DIM_TO_P3_DIM = {
+    "age_group": "age_group",
+    "gender": "gender",
+    "ccsr_diagnosis": "diagnosis",
+    "payment_typology": "payment",
+    "facility": "service_area",
+    "severity": "severity",
+}
+
+# 合法 chart_type 集合（与前端 P5 约定：未知类型一律按 bar 渲染）
+ALLOWED_CHART_TYPES = {
+    "bar", "pie", "line",                      # 旧
+    "stacked_bar", "grouped_bar", "pyramid",   # 新（bar 变体）
+    "heatmap", "sankey", "scatter",             # 新
 }
 
 
@@ -676,8 +758,11 @@ class IntentCache:
             q = last.get("question", "")
             dim = last.get("intent", {}).get("dimension", "")
             met = last.get("intent", {}).get("metric", "")
-            ctx_parts.append(f"last:{q}|{dim}|{met}")
-        raw = "q=" + question.strip() + "||ctx=" + ";".join(ctx_parts)
+            chart_hint = last.get("intent", {}).get("chart_hint") or ""
+            # chart_hint 也纳入指纹：上一轮的 chart_hint 会影响下一轮的意图继承
+            ctx_parts.append(f"last:{q}|{dim}|{met}|hint={chart_hint}")
+        # 缓存版本号纳入 hash：路由表/字段升级后旧 key 自动失效
+        raw = f"v={INTENT_CACHE_VERSION}||q=" + question.strip() + "||ctx=" + ";".join(ctx_parts)
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     # ---------- 共享 Redis 客户端（优先复用会话存储，避免再新建连接池）----------
@@ -981,6 +1066,16 @@ def _parse_intent_by_llm(question: str, history: list[dict]) -> tuple[bool, dict
                      "total_costs", "avg_costs", "payment_mix", "trend"}
     valid_genders = {"M", "F"}
     valid_age_groups = {"0 to 17", "18 to 29", "30 to 49", "50 to 69", "70 or Older"}
+    # 新版 chart_hint 白名单 + 子参数白名单（与 P3 common.py 对齐）
+    valid_chart_hints = {"severity_profile", "population_diff", "pyramid",
+                         "heatmap", "payment_composition", "sankey", "cost_relation"}
+    valid_by = {"age_group", "medical_surgical", "payment", "diagnosis"}
+    valid_heatmap_dims = {"diagnosis", "procedure", "age_group", "severity",
+                          "gender", "payment", "service_area"}
+    valid_group = {"payment1", "payment2", "payment3"}
+    valid_levels = {"payment,payment2", "payment,payment2,payment3",
+                    "payment,age_group", "payment,age_group,disease",
+                    "payment,disease", "payment,severity"}
 
     dimension = intent_raw.get("dimension", "")
     metric = intent_raw.get("metric", "")
@@ -988,6 +1083,26 @@ def _parse_intent_by_llm(question: str, history: list[dict]) -> tuple[bool, dict
         dimension = "ccsr_diagnosis"
     if metric not in valid_metrics:
         metric = "count"
+
+    # chart_hint 校验（LLM 可选返回，非法值设 None 走规则兜底）
+    chart_hint = intent_raw.get("chart_hint")
+    if chart_hint and chart_hint not in valid_chart_hints:
+        chart_hint = None
+    by = intent_raw.get("by")
+    if by and by not in valid_by:
+        by = None
+    dim1 = intent_raw.get("dim1")
+    if dim1 and dim1 not in valid_heatmap_dims:
+        dim1 = None
+    dim2 = intent_raw.get("dim2")
+    if dim2 and dim2 not in valid_heatmap_dims:
+        dim2 = None
+    group = intent_raw.get("group")
+    if group and group not in valid_group:
+        group = None
+    levels = intent_raw.get("levels")
+    if levels and levels not in valid_levels:
+        levels = None
 
     filters = intent_raw.get("filters", {}) or {}
     if not isinstance(filters, dict):
@@ -1027,13 +1142,171 @@ def _parse_intent_by_llm(question: str, history: list[dict]) -> tuple[bool, dict
         "metric": metric,
         "filters": filters,
         "top": top,
+        # 新版扩展字段（LLM 没返回时为 None，规则兜底会补）
+        "chart_hint": chart_hint,
+        "by": by,
+        "dim1": dim1,
+        "dim2": dim2,
+        "group": group,
+        "levels": levels,
     }, reasoning
 
 
 # 2.2 规则引擎兜底（带简单的上下文继承 + 性别/年龄段过滤）
+def _infer_chart_hint_params(intent: dict, question: str = "") -> None:
+    """命中 chart_hint 后，补 by/dim1/dim2/group/levels/level/mode/dimension 默认值。
+    就地修改 intent，不返回新对象。只在 intent["chart_hint"] 不为 None 时生效。
+    question 可选：传入问句后，能从自然语言里抽 dim1/dim2/group/level 等细节。
+    """
+    hint = intent.get("chart_hint")
+    if not hint:
+        return
+
+    q = question or ""
+    # dimension → by/dim1 推断
+    dim = intent.get("dimension")
+    p3_dim = DIM_TO_P3_DIM.get(dim) if dim else None
+
+    # 通用：从问句里扫描提到的 P3 维度（用于 heatmap/cross 等）
+    mentioned_dims = []
+    for kw, dv in (
+        ("诊断", "diagnosis"), ("病种", "diagnosis"), ("疾病", "diagnosis"),
+        ("手术", "procedure"), ("术式", "procedure"),
+        ("年龄", "age_group"), ("年龄段", "age_group"),
+        ("性别", "gender"),
+        ("种族", "race"),
+        ("严重", "severity"), ("病情", "severity"),
+        ("支付", "payment"),
+        ("服务区", "service_area"), ("医院", "service_area"),
+        ("县", "county"),
+    ):
+        if kw in q and dv not in mentioned_dims:
+            mentioned_dims.append(dv)
+
+    if hint == "severity_profile":
+        # by: age_group / medical_surgical / payment —— 优先看问句明确提到的视角
+        new_by = None
+        if "支付" in q or "医保" in q:
+            new_by = "payment"
+        elif "年龄" in q or "年龄段" in q:
+            new_by = "age_group"
+        elif "医疗" in q or "手术" in q or "内科外科" in q:
+            new_by = "medical_surgical"
+        if new_by:
+            intent["by"] = new_by
+        elif not intent.get("by"):
+            intent["by"] = p3_dim if p3_dim in ("age_group", "payment") else "age_group"
+    elif hint == "population_diff":
+        # dimension: gender / race / medical_surgical（P3 POP_DIMS 白名单）
+        # P4 的 DIMENSION_KEYWORDS 不识别 race/medical_surgical，必须从问句关键词抽
+        if not intent.get("by"):  # 复用 by 字段存 population_diff 的 dimension
+            if "种族" in q or "race" in q.lower():
+                intent["by"] = "race"
+            elif "医疗" in q or "内科外科" in q or "内外科" in q:
+                intent["by"] = "medical_surgical"
+            elif "性别" in q:
+                intent["by"] = "gender"
+            else:
+                intent["by"] = p3_dim if p3_dim in ("gender", "race", "medical_surgical") else "gender"
+    elif hint == "heatmap":
+        # dim1/dim2：优先用问句里提到的两个维度，回退到 dimension + 默认
+        valid = {"diagnosis", "procedure", "age_group", "severity", "gender", "payment", "service_area"}
+        dims_from_q = [d for d in mentioned_dims if d in valid]
+        if not intent.get("dim1"):
+            if dims_from_q:
+                intent["dim1"] = dims_from_q[0]
+            else:
+                intent["dim1"] = p3_dim if p3_dim else "diagnosis"
+        if not intent.get("dim2"):
+            if len(dims_from_q) >= 2 and dims_from_q[1] != intent["dim1"]:
+                intent["dim2"] = dims_from_q[1]
+            else:
+                intent["dim2"] = "age_group" if intent["dim1"] != "age_group" else "gender"
+        # 防止 dim1 == dim2（P3 会 400）
+        if intent["dim1"] == intent["dim2"]:
+            intent["dim2"] = "age_group" if intent["dim1"] != "age_group" else "gender"
+    elif hint == "payment_composition":
+        # group: payment1/2/3 —— 从问句识别"一级/二级/三级"
+        if not intent.get("group"):
+            if "一级" in q or "1级" in q or "第一" in q:
+                intent["group"] = "payment1"
+            elif "二级" in q or "2级" in q or "第二" in q:
+                intent["group"] = "payment2"
+            elif "三级" in q or "3级" in q or "第三" in q:
+                intent["group"] = "payment3"
+            else:
+                intent["group"] = "payment1"
+    elif hint == "sankey":
+        # levels 白名单默认 payment,payment2
+        if not intent.get("levels"):
+            intent["levels"] = "payment,payment2"
+    elif hint == "cost_relation":
+        # by: payment / age_group / diagnosis
+        if not intent.get("by"):
+            intent["by"] = p3_dim if p3_dim in ("payment", "age_group", "diagnosis") else "payment"
+    elif hint == "region_diff":
+        # level: service_area / county / facility —— 从问句识别
+        if not intent.get("level"):
+            if "县" in q or "医院所在县" in q:
+                intent["level"] = "county"
+            elif "医院" in q or "医疗机构" in q or "机构" in q:
+                intent["level"] = "facility"
+            else:
+                intent["level"] = "service_area"
+        # top 默认：facility 15，其余 20（P3 self_test 默认值）
+        if not intent.get("top"):
+            intent["top"] = 15 if intent["level"] == "facility" else 20
+    elif hint == "payment_cross":
+        # dim2: age_group / diagnosis / severity —— 从问句识别
+        if not intent.get("dim2"):
+            if "诊断" in q or "病种" in q or "疾病" in q:
+                intent["dim2"] = "diagnosis"
+            elif "严重" in q or "病情" in q:
+                intent["dim2"] = "severity"
+            else:
+                intent["dim2"] = p3_dim if p3_dim in ("age_group", "diagnosis", "severity") else "age_group"
+    elif hint == "oop_burden":
+        # dimension: disease / age_group / county —— 从问句识别
+        if not intent.get("dimension"):
+            if "年龄" in q or "年龄段" in q:
+                intent["dimension"] = "age_group"
+            elif "县" in q:
+                intent["dimension"] = "county"
+            elif "诊断" in q or "病种" in q or "疾病" in q:
+                intent["dimension"] = "disease"
+            else:
+                intent["dimension"] = "disease"
+        # mode 默认 selfpay1（有真实金额，更有信息量）
+        if not intent.get("mode"):
+            intent["mode"] = "selfpay1"
+    elif hint == "payment_summary":
+        pass  # summary 无业务参数，只接受 filters
+    elif hint == "top_diagnoses":
+        # 默认 top 20（P3 文档默认值）
+        if not intent.get("top"):
+            intent["top"] = 20
+    elif hint == "top_procedures":
+        if not intent.get("top"):
+            intent["top"] = 20
+
+
 def _parse_intent_by_rules(question: str, history: list[dict]) -> dict:
     """规则引擎解析意图，支持简单的上下文继承。"""
-    intent = {"dimension": None, "metric": None, "filters": {}, "top": 10}
+    intent = {
+        "dimension": None, "metric": None, "filters": {}, "top": 10,
+        # 新版扩展字段（chart_hint 命中时才用，None 时走旧逻辑）
+        "chart_hint": None, "by": None, "dim1": None, "dim2": None,
+        "group": None, "levels": None,
+        # 新增 5 个端点专用字段
+        "level": None,      # region_diff: service_area / county / facility
+        "mode": None,       # oop_burden: selfpay1 / any_layer
+    }
+
+    # —— 新增：先扫 CHART_HINT_KEYWORDS，命中则设 chart_hint ——
+    for kw in sorted(CHART_HINT_KEYWORDS, key=len, reverse=True):
+        if kw in question:
+            intent["chart_hint"] = CHART_HINT_KEYWORDS[kw]
+            break
 
     # 指标匹配（优先匹配更长关键词）
     for kw in sorted(METRIC_KEYWORDS, key=len, reverse=True):
@@ -1102,12 +1375,53 @@ def _parse_intent_by_rules(question: str, history: list[dict]) -> dict:
         # age_group 继承
         if "age_group" not in intent["filters"] and last_intent.get("filters", {}).get("age_group"):
             intent["filters"]["age_group"] = last_intent["filters"]["age_group"]
+        # 新增：chart_hint 及其子参数继承（用户第 2 轮"换成年龄段视角"时自动继承第 1 轮的 chart_hint）
+        if not intent["chart_hint"] and last_intent.get("chart_hint"):
+            intent["chart_hint"] = last_intent["chart_hint"]
+        for f in ("by", "dim1", "dim2", "group", "levels", "level", "mode", "dimension"):
+            if not intent.get(f) and last_intent.get(f):
+                intent[f] = last_intent[f]
 
-    # 兜底默认值
-    if not intent["dimension"]:
-        intent["dimension"] = "ccsr_diagnosis"
-    if not intent["metric"]:
-        intent["metric"] = "count"
+    # —— 命中 chart_hint 时，补 by/dim1/dim2/group/levels 默认值 ——
+    if intent["chart_hint"]:
+        _infer_chart_hint_params(intent, question)
+    else:
+        # 智能推断 1：top-N 自然句式 —— "住院人数最多的前3种疾病"
+        # 没命中显式关键词，但 dimension 已识别为 diagnosis/procedure 且问句含 top-N 意图时，
+        # 自动升级到新接口（新接口能返回 code+name，旧 /analysis/aggregate 只返回 key）
+        dim = intent.get("dimension")
+        top_intent = any(w in question for w in ("最多", "前几", "排行", "top", "Top", "TOP",
+                                                  "前 1", "前 2", "前 3", "前 4", "前 5",
+                                                  "前 6", "前 7", "前 8", "前 9",
+                                                  "前1", "前2", "前3", "前4", "前5",
+                                                  "前6", "前7", "前8", "前9"))
+        if top_intent and dim == "ccsr_diagnosis":
+            intent["chart_hint"] = "top_diagnoses"
+        elif top_intent and dim == "procedure":
+            intent["chart_hint"] = "top_procedures"
+
+        # 智能推断 2：支付交叉自然句式 —— "支付方式与年龄段的交叉分析"
+        # "支付"和"交叉"任意位置组合，且不含"热力图/热图"关键词（否则走 heatmap）
+        if not intent["chart_hint"]:
+            if ("支付" in question and "交叉" in question
+                    and "热力图" not in question and "热图" not in question):
+                intent["chart_hint"] = "payment_cross"
+
+        if intent["chart_hint"]:
+            _infer_chart_hint_params(intent, question)
+
+    # 兜底默认值（chart_hint 命中时不强制设 dimension/metric，避免干扰新接口）
+    if not intent["chart_hint"]:
+        if not intent["dimension"]:
+            intent["dimension"] = "ccsr_diagnosis"
+        if not intent["metric"]:
+            intent["metric"] = "count"
+    else:
+        # chart_hint 命中但 metric/dimension 没匹配到时，给个合理默认
+        if not intent["metric"]:
+            intent["metric"] = "count"
+        if not intent["dimension"]:
+            intent["dimension"] = "ccsr_diagnosis"
     return intent
 
 
@@ -1184,10 +1498,161 @@ def _validate_intent_by_llm(intent: dict, question: str) -> dict:
     }
 
 
+# ------------------------------------------------------------
+# 3.1 P3 新版接口路由表 + 参数构造（chart_hint → P3 新端点）
+# ------------------------------------------------------------
+def _map_metric(metric: str, allowed: set) -> str:
+    """把 P4 metric 翻译为 P3 新接口 metric，并校验白名单。不支持时降级 count。"""
+    p3_metric = METRIC_TO_P3.get(metric)
+    if p3_metric is None or p3_metric not in allowed:
+        return "count"
+    return p3_metric
+
+
+def _build_severity_profile_params(intent: dict) -> dict:
+    by = intent.get("by") or "age_group"
+    if by not in ("age_group", "medical_surgical", "payment"):
+        by = "age_group"
+    return {"by": by, "metric": _map_metric(intent.get("metric"), {"count", "avg_charges"})}
+
+
+def _build_population_diff_params(intent: dict) -> dict:
+    dim = intent.get("by") or "gender"
+    if dim not in ("gender", "race", "medical_surgical"):
+        dim = "gender"
+    return {"dimension": dim, "metric": _map_metric(intent.get("metric"), {"count", "avg_charges", "avg_los"})}
+
+
+def _build_pyramid_params(intent: dict) -> dict:
+    return {}  # pyramid 只接受 filters，无业务参数
+
+
+def _build_heatmap_params(intent: dict) -> dict:
+    dim1 = intent.get("dim1") or "diagnosis"
+    dim2 = intent.get("dim2") or "age_group"
+    valid = {"diagnosis", "procedure", "age_group", "severity", "gender", "payment", "service_area"}
+    if dim1 not in valid:
+        dim1 = "diagnosis"
+    if dim2 not in valid:
+        dim2 = "age_group"
+    if dim1 == dim2:
+        dim2 = "age_group" if dim1 != "age_group" else "gender"
+    return {"dim1": dim1, "dim2": dim2,
+            "metric": _map_metric(intent.get("metric"), {"count", "avg_charges", "avg_los"}),
+            "top": min(intent.get("top", 15), 50)}
+
+
+def _build_payment_composition_params(intent: dict) -> dict:
+    group = intent.get("group") or "payment1"
+    if group not in ("payment1", "payment2", "payment3"):
+        group = "payment1"
+    return {"group": group, "metric": _map_metric(intent.get("metric"), {"count", "total_charges"})}
+
+
+def _build_sankey_params(intent: dict) -> dict:
+    levels = intent.get("levels") or "payment,payment2"
+    if levels not in {"payment,payment2", "payment,payment2,payment3",
+                      "payment,age_group", "payment,age_group,disease",
+                      "payment,disease", "payment,severity"}:
+        levels = "payment,payment2"
+    return {"levels": levels, "top_disease": min(intent.get("top_disease", 8), 20)}
+
+
+def _build_cost_relation_params(intent: dict) -> dict:
+    by = intent.get("by") or "payment"
+    if by not in ("payment", "age_group", "diagnosis"):
+        by = "payment"
+    return {"by": by, "top": min(intent.get("top", 30), 100)}
+
+
+def _build_region_diff_params(intent: dict) -> dict:
+    level = intent.get("level") or "service_area"
+    if level not in ("service_area", "county", "facility"):
+        level = "service_area"
+    # top：facility 默认 15（医院名长），其余默认 20，上限 50（P3 文档约定）
+    top_default = 15 if level == "facility" else 20
+    return {
+        "level": level,
+        "metric": _map_metric(intent.get("metric"), {"count", "total_charges", "avg_charges"}),
+        "top": min(intent.get("top", top_default), 50),
+    }
+
+
+def _build_payment_cross_params(intent: dict) -> dict:
+    dim2 = intent.get("dim2") or "age_group"
+    if dim2 not in ("age_group", "diagnosis", "severity"):
+        dim2 = "age_group"
+    return {
+        "dim2": dim2,
+        "metric": _map_metric(intent.get("metric"), {"count", "total_charges"}),
+        "top": min(intent.get("top", 15), 50),
+    }
+
+
+def _build_oop_burden_params(intent: dict) -> dict:
+    dimension = intent.get("dimension") or "disease"
+    if dimension not in ("disease", "age_group", "county"):
+        dimension = "disease"
+    mode = intent.get("mode") or "selfpay1"
+    if mode not in ("selfpay1", "any_layer"):
+        mode = "selfpay1"
+    return {
+        "dimension": dimension,
+        "mode": mode,
+        "top": min(intent.get("top", 15), 50),
+    }
+
+
+def _build_payment_summary_params(intent: dict) -> dict:
+    # summary 无业务参数，只接受 filters（由 call_analysis_api 透传）
+    return {}
+
+
+def _build_top_diagnoses_params(intent: dict) -> dict:
+    return {
+        "metric": _map_metric(intent.get("metric"),
+                              {"count", "total_charges", "avg_charges", "avg_los"}),
+        "top": min(intent.get("top", 20), 100),
+    }
+
+
+def _build_top_procedures_params(intent: dict) -> dict:
+    return {
+        "metric": _map_metric(intent.get("metric"),
+                              {"count", "total_charges", "avg_charges"}),
+        "top": min(intent.get("top", 20), 100),
+    }
+
+
+# 路由表：chart_hint → P3 新接口端点 + 参数构造函数 + 超时
+ROUTE_TABLE = {
+    # —— 模块一：病种与手术分析（7 个）——
+    "top_diagnoses":       {"endpoint": "/disease/top-diagnoses",    "build": _build_top_diagnoses_params,       "timeout": 15},
+    "top_procedures":      {"endpoint": "/disease/top-procedures",   "build": _build_top_procedures_params,      "timeout": 15},
+    "severity_profile":    {"endpoint": "/disease/severity-profile", "build": _build_severity_profile_params,    "timeout": 15},
+    "population_diff":     {"endpoint": "/disease/population-diff",  "build": _build_population_diff_params,     "timeout": 15},
+    "pyramid":             {"endpoint": "/disease/pyramid",         "build": _build_pyramid_params,             "timeout": 15},
+    "region_diff":         {"endpoint": "/disease/region-diff",      "build": _build_region_diff_params,         "timeout": 15},
+    "heatmap":             {"endpoint": "/disease/heatmap",          "build": _build_heatmap_params,             "timeout": 15},
+    # —— 模块二：支付分析（6 个）——
+    "payment_composition": {"endpoint": "/payment/composition",      "build": _build_payment_composition_params, "timeout": 15},
+    "payment_cross":       {"endpoint": "/payment/cross",            "build": _build_payment_cross_params,       "timeout": 15},
+    "sankey":              {"endpoint": "/payment/sankey",           "build": _build_sankey_params,              "timeout": 20},
+    "cost_relation":       {"endpoint": "/payment/cost-relation",    "build": _build_cost_relation_params,       "timeout": 15},
+    "oop_burden":          {"endpoint": "/payment/oop-burden",       "build": _build_oop_burden_params,          "timeout": 15},
+    "payment_summary":     {"endpoint": "/payment/summary",          "build": _build_payment_summary_params,    "timeout": 15},
+}
+# 注：/api/v1/meta/dimensions 不在路由表（由前端启动时直接调用，不经 P4）
+
+# P3 新接口支持的 filters 白名单（12 种，比旧版 3 种多）
+P3_FILTER_KEYS = ("year", "gender", "age_group", "payment", "payment2", "payment3",
+                  "severity", "diagnosis", "procedure", "service_area", "county", "facility")
+
+
 def call_analysis_api(intent: dict, question: str = "", use_llm_validate: bool = True) -> dict:
     """根据意图匹配并调用对应分析 API，返回结构化结果。
 
-    - 路由规则（核心）：永远按 metric 硬编码匹配接口，不交给 LLM（避免幻觉路由）
+    - 路由规则（核心）：chart_hint 命中走 P3 新版接口，否则走旧版 if-elif（向后兼容）
     - LLM 审查（可选）：检查参数合法性，把 warnings/suggestions 写进返回 meta，不改变实际调用
     """
     # —— 第一步：LLM 做参数审查（不阻塞、不改变调用）——
@@ -1198,24 +1663,36 @@ def call_analysis_api(intent: dict, question: str = "", use_llm_validate: bool =
         except Exception:
             validation = {}  # 永远不让审查影响主链路
 
-    # —— 第二步：规则路由（稳定，永远执行）——
-    metric = intent["metric"]
-    if metric == "payment_mix":
-        url = f"{ANALYSIS_API}/analysis/payment-mix"
-        params = {}
-    elif metric == "trend":
-        url = f"{ANALYSIS_API}/analysis/trend"
-        params = {}
+    # —— 第二步：路由决策（chart_hint 优先，未命中走旧 if-elif）——
+    chart_hint = intent.get("chart_hint")
+    filters = intent.get("filters", {})
+
+    if chart_hint and chart_hint in ROUTE_TABLE:
+        # 走 P3 新版接口
+        route = ROUTE_TABLE[chart_hint]
+        url = f"{ANALYSIS_API}{route['endpoint']}"
+        params = route["build"](intent)
+        timeout = route["timeout"]
     else:
-        url = f"{ANALYSIS_API}/analysis/aggregate"
-        params = {"dimension": intent["dimension"], "metric": metric, "top": intent["top"]}
+        # 走旧版接口（严格保留原逻辑，向后兼容）
+        metric = intent["metric"]
+        if metric == "payment_mix":
+            url = f"{ANALYSIS_API}/analysis/payment-mix"
+            params = {}
+        elif metric == "trend":
+            url = f"{ANALYSIS_API}/analysis/trend"
+            params = {}
+        else:
+            url = f"{ANALYSIS_API}/analysis/aggregate"
+            params = {"dimension": intent["dimension"], "metric": metric, "top": intent["top"]}
+        timeout = 10
 
-    # filters 里的 year/gender/age_group 也作为 URL 参数传给 P3
-    for fkey in ("year", "gender", "age_group"):
-        if fkey in intent.get("filters", {}):
-            params[fkey] = intent["filters"][fkey]
+    # filters 透传：新接口支持全部 12 种，旧接口只认 year/gender/age_group（多余的被 P3 忽略）
+    for fkey in P3_FILTER_KEYS:
+        if fkey in filters:
+            params[fkey] = filters[fkey]
 
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(url, params=params, timeout=timeout)
     resp.raise_for_status()
     result = resp.json()
 
@@ -1228,6 +1705,9 @@ def call_analysis_api(intent: dict, question: str = "", use_llm_validate: bool =
         result.setdefault("meta", {})
         result["meta"]["intent_validation_used"] = "rules_only"
 
+    # 新增：把 P4 决策的 chart_hint 写入 meta（便于报告生成 + 前端调试）
+    result["meta"]["chart_hint"] = chart_hint
+
     return result
 
 
@@ -1239,6 +1719,7 @@ METRIC_ZH = {
     "avg_charges": "平均费用（元）",
     "total_costs": "总成本（元）",
     "avg_costs": "平均成本（元）",
+    "avg_los": "平均住院时长（天）",  # P3 新接口命名
     "payment_mix": "支付方式占比（百分比）",
     "trend": "历年变化趋势（人数）",
 }
@@ -1251,17 +1732,458 @@ DIMENSION_ZH = {
     "severity": "病情严重程度", "aprg_drg": "DRG 分组",
 }
 
+# P3 新接口用的维度/层级中文映射（P3 命名空间与 P4 不同，单列）
+P3_DIM_ZH = {
+    "diagnosis": "疾病诊断", "procedure": "手术术式",
+    "age_group": "年龄段", "gender": "性别", "severity": "严重程度",
+    "payment": "支付方式", "service_area": "服务区", "county": "区县",
+    "facility": "医院",
+    # severity_profile 的 by 取值
+    "medical_surgical": "医疗/外科",
+    # payment_composition 的 group 取值
+    "payment1": "一级支付", "payment2": "二级支付", "payment3": "三级支付",
+}
+
+# 严重程度中文（severity_profile / payment_cross 的 series 名用）
+SEVERITY_ORDER = ["Minor", "Moderate", "Major", "Extreme", "Unknown"]
+SEVERITY_ZH = {"Minor": "轻度", "Moderate": "中度", "Major": "重度",
+               "Extreme": "极重度", "Unknown": "未知"}
+
 # ECharts 友好调色板（避免默认单调的颜色）
 COLORS = ["#1e6fd9", "#ff6b6b", "#52c41a", "#faad14", "#722ed1",
           "#13c2c2", "#eb2f96", "#fa8c16", "#2f54eb", "#a0d911"]
+# 桑葚图分层配色（6 层足够）
+SANKEY_LAYER_COLORS = ["#1e6fd9", "#52c41a", "#faad14", "#722ed1",
+                       "#13c2c2", "#eb2f96"]
+# 严重程度专属配色（绿→黄→橙→红，越严重越深）
+SEVERITY_COLORS = {"Minor": "#52c41a", "Moderate": "#faad14",
+                   "Major": "#fa8c16", "Extreme": "#ff4d4f", "Unknown": "#bfbfbf"}
 
 
 # ------------------------------------------------------------
 # 4. 分析结果文本生成（LLM + 模板兜底，失败自动降级）
 # ------------------------------------------------------------
+def _summary_top_diagnoses(question, intent, api_result, dim_zh, metric_zh):
+    """4.1 top-diagnoses 摘要：用 name（人类可读名）而不是 code。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 按住院{metric_zh}排名，前 {len(data)} 种诊断如下："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        name = r.get("name") or r.get("code") or r.get("key") or "-"
+        code = r.get("code", "")
+        v = r.get("value") or r.get("count") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        v_str = f"{v:,}" if isinstance(v, int) else f"{v:,.2f}"
+        lines.append(f"  {medal} 「{name}」({code})：{v_str}")
+    if len(data) >= 2:
+        v1 = data[0].get("value") or data[0].get("count") or 0
+        v2 = data[1].get("value") or data[1].get("count") or 0
+        try:
+            ratio = float(v1) / float(v2) if v2 else 1
+            if ratio > 1:
+                lines.append(f"💡 第一名是第二名的 **{ratio:.2f} 倍**，差距明显。")
+        except (TypeError, ZeroDivisionError):
+            pass
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_top_procedures(question, intent, api_result, dim_zh, metric_zh):
+    """4.2 top-procedures 摘要：结构同 top-diagnoses。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条手术记录。",
+             f"📊 按手术{metric_zh}排名，前 {len(data)} 种术式如下："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        name = r.get("name") or r.get("code") or r.get("key") or "-"
+        code = r.get("code", "")
+        v = r.get("value") or r.get("count") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        v_str = f"{v:,}" if isinstance(v, int) else f"{v:,.2f}"
+        lines.append(f"  {medal} 「{name}」({code})：{v_str}")
+    if len(data) >= 2:
+        v1 = data[0].get("value") or data[0].get("count") or 0
+        v2 = data[1].get("value") or data[1].get("count") or 0
+        try:
+            ratio = float(v1) / float(v2) if v2 else 1
+            if ratio > 1:
+                lines.append(f"💡 第一名是第二名的 **{ratio:.2f} 倍**。")
+        except (TypeError, ZeroDivisionError):
+            pass
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_severity_profile(question, intent, api_result, dim_zh, metric_zh):
+    """4.3 severity-profile 摘要：按 group 总结严重程度构成。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    by = intent.get("by", "age_group")
+    by_zh = P3_DIM_ZH.get(by, by)
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 按「{by_zh}」分组，严重程度构成如下："]
+    # 重建 {group: {severity: value, total}}
+    groups, seen = [], set()
+    for r in data:
+        g = r.get("group")
+        if g and g not in seen:
+            groups.append(g); seen.add(g)
+    idx = {g: {} for g in groups}
+    for r in data:
+        g, s = r.get("group"), r.get("severity")
+        if g in idx:
+            idx[g][s] = r.get("value") or r.get("count") or 0
+    for gi, g in enumerate(groups[:5]):
+        gdict = idx[g]
+        gtotal = sum(gdict.values())
+        sev_str = " / ".join(f"{SEVERITY_ZH.get(s, s)}={gdict[s]:,}"
+                             for s in SEVERITY_ORDER if s in gdict)
+        lines.append(f"  {gi+1}. 「{g}」合计 {gtotal:,}：{sev_str}")
+    # 找极重度占比最高的组
+    extreme_max_g, extreme_max_v = None, 0
+    for g in groups:
+        ev = idx[g].get("Extreme", 0)
+        gtotal = sum(idx[g].values())
+        if gtotal and ev / gtotal > extreme_max_v:
+            extreme_max_v = ev / gtotal
+            extreme_max_g = g
+    if extreme_max_g:
+        lines.append(f"💡 「{extreme_max_g}」极重度占比最高（{extreme_max_v*100:.1f}%），需重点关注。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_population_diff(question, intent, api_result, dim_zh, metric_zh):
+    """4.4 population-diff 摘要：按 key 总结分布占比。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    by = intent.get("by", "gender")
+    by_zh = P3_DIM_ZH.get(by, by)
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 按「{by_zh}」分组，分布占比："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        key = r.get("key") or "-"
+        v = r.get("value") or r.get("count") or 0
+        pct = r.get("pct") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(f"  {medal} 「{key}」：{v:,}（{pct}%）")
+    if len(data) >= 2:
+        v1 = data[0].get("value") or data[0].get("count") or 0
+        v2 = data[1].get("value") or data[1].get("count") or 0
+        if v2:
+            ratio = v1 / v2
+            if ratio > 1:
+                lines.append(f"💡 「{data[0].get('key','-')}」是「{data[1].get('key','-')}」的 **{ratio:.2f} 倍**。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_pyramid(question, intent, api_result, dim_zh, metric_zh):
+    """4.5 pyramid 摘要：人口金字塔，男女对比。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录（已排除性别空值）。",
+             "📊 按年龄段看男女分布："]
+    male_total = sum(int(r.get("male") or 0) for r in data)
+    female_total = sum(int(r.get("female") or 0) for r in data)
+    lines.append(f"  👨 男性合计 {male_total:,} 人；👩 女性合计 {female_total:,} 人。")
+    # 找老年段（70 or Older）
+    elder = next((r for r in data if "70" in str(r.get("age_group", ""))), None)
+    if elder:
+        m, f = int(elder.get("male") or 0), int(elder.get("female") or 0)
+        if m + f:
+            lines.append(f"💡 老年段（{elder.get('age_group')}）男女比 {m/f:.2f}，"
+                         + ("女性显著多于男性。" if f > m * 1.2 else "男性显著多于女性。" if m > f * 1.2 else "男女相当。"))
+    # 找儿童段
+    child = next((r for r in data if "0 to 17" in str(r.get("age_group", ""))), None)
+    if child:
+        lines.append(f"  👶 儿童段（0 to 17）合计 {int(child.get('total') or 0):,} 人。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_region_diff(question, intent, api_result, dim_zh, metric_zh):
+    """4.6 region-diff 摘要：按 level 总结地区分布。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    level = intent.get("level", "service_area")
+    level_zh = P3_DIM_ZH.get(level, level)
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 按「{level_zh}」分组，住院分布："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        key = r.get("key") or r.get("name") or "-"
+        if len(key) > 30:
+            key = key[:28] + "..."
+        v = r.get("value") or r.get("count") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        pct = (v * 100.0 / total) if total else 0
+        lines.append(f"  {medal} 「{key}」：{v:,}（占 {pct:.1f}%）")
+    if len(data) >= 2:
+        v1 = data[0].get("value") or data[0].get("count") or 0
+        v2 = data[1].get("value") or data[1].get("count") or 0
+        if v2:
+            ratio = v1 / v2
+            if ratio > 1:
+                lines.append(f"💡 第一名「{str(data[0].get('key','-'))[:20]}」是第二名的 **{ratio:.2f} 倍**。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_heatmap(question, intent, api_result, dim_zh, metric_zh):
+    """4.7 heatmap 摘要：找最热的格子（value 最大）。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    dim1 = intent.get("dim1", "diagnosis")
+    dim2 = intent.get("dim2", "age_group")
+    dim1_zh = P3_DIM_ZH.get(dim1, dim1)
+    dim2_zh = P3_DIM_ZH.get(dim2, dim2)
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 「{dim1_zh} × {dim2_zh}」热力图共 {len(data)} 个格子。"]
+    if not data:
+        lines.append("  ⚠️ 数据为空。")
+        return "\n".join(lines)
+    top = sorted(data, key=lambda r: r.get("value") or r.get("count") or 0, reverse=True)[:3]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(top):
+        x = r.get("dim1_name") or r.get("dim1") or "-"
+        y = r.get("dim2_name") or r.get("dim2") or "-"
+        v = r.get("value") or r.get("count") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(f"  {medal} 「{x}」×「{y}」：{v:,}")
+    # 计算稀疏度
+    if total and len(data) > 5:
+        avg = sum(r.get("value") or r.get("count") or 0 for r in data) / len(data)
+        max_v = max(r.get("value") or r.get("count") or 0 for r in data)
+        if max_v > avg * 3:
+            lines.append(f"💡 最热格子值 {max_v:,} 是平均值的 {max_v/avg:.1f} 倍，分布极不均衡。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_payment_composition(question, intent, api_result, dim_zh, metric_zh):
+    """5.1 payment-composition 摘要：主要支付方式 + null_excluded 提示。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    null_excluded = meta.get("null_excluded", 0) or 0
+    group = intent.get("group", "payment1")
+    group_zh = P3_DIM_ZH.get(group, group)
+    lines = [f"📋 针对您的问题「{question}」，分析支付构成。",
+             f"📊 「{group_zh}」构成（按 {metric_zh}）："]
+    if null_excluded:
+        kept_total = total + null_excluded
+        kept_pct = total * 100.0 / kept_total if kept_total else 0
+        lines.append(f"  ⚠️ 已排除 {null_excluded:,} 条无该层支付方式记录（保留 {kept_pct:.1f}%）。")
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        key = r.get("key") or "-"
+        v = r.get("value") or r.get("count") or 0
+        pct = r.get("pct") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(f"  {medal} 「{key}」：{v:,}（{pct}%）")
+    if len(data) >= 2:
+        p1 = data[0].get("pct") or 0
+        p2 = data[1].get("pct") or 0
+        if p1 > p2:
+            lines.append(f"💡 「{data[0].get('key','-')}」占比 {p1}%，比第二名高 {p1-p2:.2f} 个百分点。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_payment_cross(question, intent, api_result, dim_zh, metric_zh):
+    """5.2 payment-cross 摘要：主要支付 × 主要 dim2 + 主流组合。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    dim2 = intent.get("dim2", "age_group")
+    dim2_zh = P3_DIM_ZH.get(dim2, dim2)
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条记录。",
+             f"📊 支付方式 × {dim2_zh} 交叉分析："]
+    # 找最大的组合（全局 max）
+    if data:
+        top_cell = max(data, key=lambda r: r.get("value") or r.get("count") or 0)
+        k = top_cell.get("key", "-")
+        s = top_cell.get("dim2_name") or top_cell.get("dim2", "-")
+        v = top_cell.get("value") or top_cell.get("count") or 0
+        lines.append(f"  🔝 最大组合：「{k}」×「{s}」：{v:,} 人。")
+        # 按 key 汇总前 3 个支付方式
+        key_sum, key_seen = {}, set()
+        for r in data:
+            k2 = r.get("key")
+            if k2 and k2 not in key_seen:
+                key_seen.add(k2)
+            key_sum[k2] = key_sum.get(k2, 0) + (r.get("value") or r.get("count") or 0)
+        top_keys = sorted(key_sum.items(), key=lambda x: x[1], reverse=True)[:3]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, (k2, v2) in enumerate(top_keys):
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            lines.append(f"  {medal} 「{k2}」合计 {v2:,} 人。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_sankey(question, intent, api_result, dim_zh, metric_zh):
+    """5.3 sankey 摘要：链路 source→target + 流量。"""
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):
+        raw = {"nodes": [], "links": []}
+    nodes = raw.get("nodes", [])
+    links = raw.get("links", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    null_excluded = meta.get("null_excluded", 0) or 0
+    levels = meta.get("levels", "payment,payment2")
+    lines = [f"📋 针对您的问题「{question}」，分析支付链路「{levels}」。",
+             f"📊 链路共 {len(nodes)} 个节点、{len(links)} 条流向。"]
+    if total:
+        lines.append(f"  ✅ 走完全程 {total:,} 条记录。")
+    if null_excluded:
+        kept_pct = total * 100.0 / (total + null_excluded) if (total + null_excluded) else 0
+        lines.append(f"  ⚠️ 因中间层为空而退出链路 {null_excluded:,} 条（保留 {kept_pct:.1f}%）。")
+    # 找最大流
+    if links:
+        top_link = max(links, key=lambda l: l.get("value") or 0)
+        src = top_link.get("source", "-")
+        tgt = top_link.get("target", "-")
+        v = top_link.get("value", 0)
+        # 去掉 layer 前缀让展示更友好
+        if "|" in src: src = src.split("|", 1)[1]
+        if "|" in tgt: tgt = tgt.split("|", 1)[1]
+        lines.append(f"💡 最大流：「{src}」→「{tgt}」{v:,} 人。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_cost_relation(question, intent, api_result, dim_zh, metric_zh):
+    """5.4 cost-relation 摘要：费用/成本比最高/最低。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    by = intent.get("by", "payment")
+    by_zh = P3_DIM_ZH.get(by, by)
+    lines = [f"📋 针对您的问题「{question}」，按「{by_zh}」分组共 {len(data)} 条记录。",
+             "📊 费用-成本关系（按费用/成本比排序）："]
+    if not data:
+        return "\n".join(lines) + "\n  ⚠️ 数据为空。"
+    sorted_by_ratio = sorted(data, key=lambda r: r.get("charge_cost_ratio") or 0, reverse=True)
+    # 比率最高
+    top = sorted_by_ratio[0]
+    bot = sorted_by_ratio[-1]
+    lines.append(f"  🔼 费/本比最高：「{top.get('key','-')}」{top.get('charge_cost_ratio',0)} "
+                 f"（次均费用 {top.get('avg_charges',0):,.0f} / 次均成本 {top.get('avg_costs',0):,.0f}）")
+    lines.append(f"  🔽 费/本比最低：「{bot.get('key','-')}」{bot.get('charge_cost_ratio',0)} "
+                 f"（次均费用 {bot.get('avg_charges',0):,.0f} / 次均成本 {bot.get('avg_costs',0):,.0f}）")
+    # 平均比率
+    ratios = [r.get("charge_cost_ratio") or 0 for r in data]
+    avg_ratio = sum(ratios) / len(ratios) if ratios else 0
+    lines.append(f"💡 整体平均费/本比 {avg_ratio:.2f}；高于 3.0 的支付方式需关注定价合理性。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_oop_burden(question, intent, api_result, dim_zh, metric_zh):
+    """5.5 oop-burden 摘要：自付负担最重的组。"""
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    dimension = intent.get("dimension", "disease")
+    dim_zh = P3_DIM_ZH.get(dimension, dimension)
+    mode = intent.get("mode", "selfpay1")
+    lines = [f"📋 针对您的问题「{question}」，按「{dim_zh}」分组共 {len(data)} 条记录。",
+             f"📊 自付负担分析（mode={mode}，按 self_pay_count 降序）："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        key = r.get("key") or "-"
+        if len(key) > 30:
+            key = key[:28] + "..."
+        pct = r.get("self_pay_pct") or 0
+        sp_count = r.get("self_pay_count") or 0
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        line = f"  {medal} 「{key}」：自付 {sp_count:,} 人（{pct}%）"
+        if mode == "selfpay1":
+            avg_chg = r.get("self_pay_avg_charges") or 0
+            line += f"，自付次均费用 {avg_chg:,.0f}"
+        lines.append(line)
+    if data:
+        top = data[0]
+        lines.append(f"💡 「{top.get('key','-')}」自付负担最重；建议关注该人群的医保覆盖与减免政策。")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+def _summary_payment_summary(question, intent, api_result, dim_zh, metric_zh):
+    """5.6 payment-summary KPI 摘要。"""
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):
+        raw = {}
+    meta = api_result.get("meta", {})
+    lines = [f"📋 针对您的问题「{question}」，KPI 总览大屏。",
+             "📊 关键指标如下："]
+    lines.append(f"  📋 总记录 {raw.get('total_records', 0):,} 条")
+    lines.append(f"  💰 总费用 {raw.get('total_charges', 0):,.0f} 元 / 总成本 {raw.get('total_costs', 0):,.0f} 元")
+    lines.append(f"  💵 次均费用 {raw.get('avg_charges', 0):,.2f} 元 / 次均成本 {raw.get('avg_costs', 0):,.2f} 元")
+    lines.append(f"  ⏰ 平均住院 {raw.get('avg_los', 0)} 天")
+    lines.append(f"  👤 自付 {raw.get('self_pay_count', 0):,} 人（{raw.get('self_pay_pct', 0)}%）")
+    tp = raw.get("top_payment") or {}
+    if tp:
+        lines.append(f"  🏆 主要支付方式：「{tp.get('key', '-')}」（{tp.get('pct', 0)}%）")
+    sev = raw.get("severity_distribution") or {}
+    sev_str = " / ".join(f"{SEVERITY_ZH.get(k,k)}={v:,}" for k, v in sev.items() if k in SEVERITY_ORDER)
+    if sev_str:
+        lines.append(f"  🩺 严重程度分布：{sev_str}")
+    ed = raw.get("ed_count", 0)
+    if ed:
+        lines.append(f"  🚑 急诊就诊 {ed:,} 人次")
+    lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
+# chart_hint → 模板摘要生成函数路由表（LLM 失败兜底用）
+SUMMARY_BUILDERS = {
+    "top_diagnoses":       _summary_top_diagnoses,
+    "top_procedures":      _summary_top_procedures,
+    "severity_profile":    _summary_severity_profile,
+    "population_diff":     _summary_population_diff,
+    "pyramid":             _summary_pyramid,
+    "region_diff":         _summary_region_diff,
+    "heatmap":             _summary_heatmap,
+    "payment_composition": _summary_payment_composition,
+    "payment_cross":       _summary_payment_cross,
+    "sankey":              _summary_sankey,
+    "cost_relation":       _summary_cost_relation,
+    "oop_burden":          _summary_oop_burden,
+    "payment_summary":     _summary_payment_summary,
+}
+
+
 def _fallback_template_summary(question: str, intent: dict, api_result: dict,
                                dim_zh: str, metric_zh: str) -> str:
-    """抽取模板逻辑为独立函数，方便 LLM 失败时直接复用兜底。"""
+    """抽取模板逻辑为独立函数，方便 LLM 失败时直接复用兜底。
+
+    路由优先级：
+      1) chart_hint 命中 SUMMARY_BUILDERS → 走专用 P3 摘要生成器（13 种）
+      2) 未命中 → 走旧版通用 top-N 模板
+    """
+    chart_hint = intent.get("chart_hint")
+    if chart_hint and chart_hint in SUMMARY_BUILDERS:
+        try:
+            return SUMMARY_BUILDERS[chart_hint](question, intent, api_result, dim_zh, metric_zh)
+        except Exception as e:
+            print(f"[SUMMARY BUILDER ERROR] {chart_hint}: {e}，降级到通用模板")
+            # 失败时降级到下面的通用模板逻辑
+    # 旧版通用 top-N 模板
     data = api_result.get("data", [])
     meta = api_result.get("meta", {})
     total = meta.get("total_records", 0) or 0
@@ -1305,10 +2227,22 @@ def generate_text_summary(question, intent, api_result, history=None):
     history 不为空时，告诉 LLM 这是多轮对话，让回答更连贯。
     """
     print(f"[DEBUG] LLM_ENABLED = {LLM_ENABLED}")
+    chart_hint = intent.get("chart_hint")
+    # payment_summary 的 data 是单个对象（KPI 大屏），不是 list —— 特殊处理
+    if chart_hint == "payment_summary":
+        raw = api_result.get("data") if api_result else None
+        if not isinstance(raw, dict) or not raw:
+            return "❌ 未查询到 KPI 总览数据。"
+        # 走 SUMMARY_BUILDERS 里的 _summary_payment_summary
+        return _fallback_template_summary(question, intent, api_result, "总览", "KPI")
+
     data = []
     if api_result and isinstance(api_result, dict):
         data = api_result.get("data", [])
-    print(f"[DEBUG] data length = {len(data)}")
+        # sankey 的 data 是 dict（nodes/links），不是 list
+        if isinstance(data, dict):
+            data = data.get("nodes", []) or data.get("links", [])
+    print(f"[DEBUG] data length = {len(data) if isinstance(data, list) else 'non-list'}")
     if not data:
         return "❌ 未查询到符合条件的分析结果，请调整查询条件后重试。"
 
@@ -1410,13 +2344,628 @@ def _suggest_chart_by_llm(intent: dict, dim_zh: str, metric_zh: str,
     }
 
 
+# ------------------------------------------------------------
+# 5.x P3 新版接口专用图表构造器（13 个）—— 命中 chart_hint 时调用
+# 每个函数签名：(intent, api_result, suggestion) -> {chart_type, option, _suggestion_source}
+# ------------------------------------------------------------
+def _base_title(suggestion: dict, default_text: str) -> dict:
+    """构造 ECharts title 对象，优先用 LLM 建议的标题。"""
+    title_obj = {"text": suggestion.get("title") or default_text,
+                 "left": "center", "textStyle": {"fontSize": 15}}
+    sub = suggestion.get("subtitle")
+    if sub:
+        title_obj["subtext"] = sub
+        title_obj["itemGap"] = 8
+    return title_obj
+
+
+def _fmt_num(v) -> str:
+    """统一数字格式化：浮点保留 2 位带千分位，整数直接千分位。"""
+    if v is None:
+        return "-"
+    try:
+        if isinstance(v, float):
+            return f"{v:,.2f}"
+        return f"{int(v):,}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _build_top_diagnoses_option(intent, api_result, suggestion):
+    """4.1 top-diagnoses 柱状图：X=name（人类可读名），Y=value。"""
+    data = api_result.get("data", [])
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    cats = [r.get("name") or r.get("code") or r.get("key") or "-" for r in data]
+    vals = [r.get("value") or r.get("count") or 0 for r in data]
+    title_obj = _base_title(suggestion, "诊断排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>" + metric_zh + ": {c}"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "诊断"},
+        "yAxis": {"type": "value", "name": metric_zh},
+        "series": [{
+            "type": "bar", "name": metric_zh, "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "fontSize": 10},
+            "markPoint": {"data": [{"type": "max", "name": "最大值"}]},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_top_procedures_option(intent, api_result, suggestion):
+    """4.2 top-procedures 柱状图：X=name，Y=value。"""
+    data = api_result.get("data", [])
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    cats = [r.get("name") or r.get("code") or r.get("key") or "-" for r in data]
+    vals = [r.get("value") or r.get("count") or 0 for r in data]
+    title_obj = _base_title(suggestion, "手术谱排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "手术"},
+        "yAxis": {"type": "value", "name": metric_zh},
+        "series": [{
+            "type": "bar", "name": metric_zh, "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "fontSize": 10},
+            "markPoint": {"data": [{"type": "max", "name": "最大值"}]},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_severity_profile_option(intent, api_result, suggestion):
+    """4.3 severity-profile 堆叠柱：X=group，系列=severity（按 Minor→Extreme 顺序）。"""
+    data = api_result.get("data", [])
+    by = intent.get("by", "age_group")
+    by_zh = P3_DIM_ZH.get(by, by)
+    # 提取所有 group（按首次出现顺序）和所有 severity（按固定顺序）
+    groups, seen = [], set()
+    for r in data:
+        g = r.get("group")
+        if g and g not in seen:
+            groups.append(g); seen.add(g)
+    sev_list = [s for s in SEVERITY_ORDER if any(r.get("severity") == s for r in data)]
+    # 没在固定顺序里的 severity（理论上不会发生）
+    for r in data:
+        s = r.get("severity")
+        if s and s not in SEVERITY_ORDER and s not in sev_list:
+            sev_list.append(s)
+    # 重建二维索引：{group: {severity: value}}
+    idx = {g: {} for g in groups}
+    for r in data:
+        g, s = r.get("group"), r.get("severity")
+        if g in idx:
+            idx[g][s] = r.get("value") or r.get("count") or 0
+    series = []
+    for s in sev_list:
+        series.append({
+            "type": "bar", "name": SEVERITY_ZH.get(s, s), "stack": "severity",
+            "data": [idx[g].get(s, 0) for g in groups],
+            "itemStyle": {"color": SEVERITY_COLORS.get(s)},
+            "emphasis": {"focus": "series"},
+        })
+    title_obj = _base_title(suggestion, f"按{by_zh}看严重程度构成")
+    option = {
+        "color": [SEVERITY_COLORS.get(s, COLORS[i % len(COLORS)]) for i, s in enumerate(sev_list)],
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {"top": 30, "data": [SEVERITY_ZH.get(s, s) for s in sev_list]},
+        "grid": {"left": 70, "right": 30, "bottom": 60, "top": 80},
+        "xAxis": {"type": "category", "data": [str(g) for g in groups],
+                  "axisLabel": {"rotate": 20, "interval": 0}, "name": by_zh},
+        "yAxis": {"type": "value", "name": "人数"},
+        "series": series,
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_population_diff_option(intent, api_result, suggestion):
+    """4.4 population-diff 分组柱（其实只有 1 维，可视作单系列柱 + 占比标签）。"""
+    data = api_result.get("data", [])
+    by = intent.get("by", "gender")
+    by_zh = P3_DIM_ZH.get(by, by)
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    cats = [str(r.get("key") or "-") for r in data]
+    vals = [r.get("value") or r.get("count") or 0 for r in data]
+    pcts = [r.get("pct") or 0 for r in data]
+    title_obj = _base_title(suggestion, f"按{by_zh}看人群分布")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>" + metric_zh + ": {c}"},
+        "grid": {"left": 70, "right": 30, "bottom": 60, "top": 50},
+        "xAxis": {"type": "category", "data": cats, "name": by_zh},
+        "yAxis": {"type": "value", "name": metric_zh},
+        "series": [{
+            "type": "bar", "name": metric_zh, "data": vals, "barMaxWidth": 80,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "fontSize": 10},
+            "markPoint": {"data": [{"type": "max", "name": "最大值"}]},
+        }],
+    }
+    # 给每条柱标签带上 pct（ECharts 没法直接 lambda，用 raw 数组）
+    label_data = [{"value": v, "label": {"show": True, "position": "top",
+                                          "formatter": f"{v:,}\n({pcts[i]}%)"}}
+                  for i, v in enumerate(vals)]
+    option["series"][0]["data"] = label_data
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_pyramid_option(intent, api_result, suggestion):
+    """4.5 pyramid 人口金字塔：男为负值向左，女为正值向右（双向条形图）。"""
+    data = api_result.get("data", [])
+    cats = [str(r.get("age_group") or "-") for r in data]
+    male_vals = [-int(r.get("male") or 0) for r in data]  # 取负数让男性向左
+    female_vals = [int(r.get("female") or 0) for r in data]
+    title_obj = _base_title(suggestion, "人口金字塔（按年龄段 × 性别）")
+    option = {
+        "color": ["#1e6fd9", "#ff6b6b"],
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>{a}: {c}"},
+        "legend": {"top": 30, "data": ["男", "女"]},
+        "grid": {"left": 80, "right": 30, "bottom": 40, "top": 70},
+        "xAxis": {"type": "value",
+                  "axisLabel": {"formatter": "{value}"}},
+        "yAxis": {"type": "category", "data": cats, "inverse": True,
+                  "axisLabel": {"fontSize": 11}},
+        "series": [
+            {"name": "男", "type": "bar", "stack": "pyramid",
+             "data": male_vals, "itemStyle": {"color": "#1e6fd9"},
+             "label": {"show": True, "position": "left"}},
+            {"name": "女", "type": "bar", "stack": "pyramid",
+             "data": female_vals, "itemStyle": {"color": "#ff6b6b"},
+             "label": {"show": True, "position": "right"}},
+        ],
+    }
+    # 把绝对值显示在标签里（male_vals 是负数，label 显示 |v|）
+    option["series"][0]["data"] = [{"value": v, "label": {"show": True, "position": "left",
+                                                          "formatter": "{c}"}}
+                                    for v in male_vals]
+    option["series"][1]["data"] = [{"value": v, "label": {"show": True, "position": "right",
+                                                          "formatter": "{c}"}}
+                                    for v in female_vals]
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_region_diff_option(intent, api_result, suggestion):
+    """4.6 region-diff 横向柱：facility 模式 key 太长，强制横向 + 截断。"""
+    data = api_result.get("data", [])
+    level = intent.get("level", "service_area")
+    level_zh = P3_DIM_ZH.get(level, level)
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    # 截断长名（医院名可能 30+ 字符）
+    name_limit = 25 if level == "facility" else 40
+    cats = [(str(r.get("key") or "-"))[:name_limit] for r in data]
+    vals = [r.get("value") or r.get("count") or 0 for r in data]
+    title_obj = _base_title(suggestion, f"按{level_zh}看住院分布")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "grid": {"left": 130, "right": 50, "bottom": 40, "top": 50},
+        "xAxis": {"type": "value", "name": metric_zh},
+        "yAxis": {"type": "category", "data": cats, "inverse": True,
+                  "axisLabel": {"fontSize": 10}},
+        "series": [{
+            "type": "bar", "name": metric_zh, "data": vals, "barMaxWidth": 20,
+            "itemStyle": {"borderRadius": [0, 4, 4, 0]},
+            "label": {"show": True, "position": "right", "fontSize": 10},
+            "markPoint": {"data": [{"type": "max", "name": "最大值"}]},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_heatmap_option(intent, api_result, suggestion):
+    """4.7 heatmap 热力图：dim1 × dim2 × value 三元组。"""
+    data = api_result.get("data", [])
+    dim1 = intent.get("dim1", "diagnosis")
+    dim2 = intent.get("dim2", "age_group")
+    dim1_zh = P3_DIM_ZH.get(dim1, dim1)
+    dim2_zh = P3_DIM_ZH.get(dim2, dim2)
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    # 提取两个轴的标签（按首次出现顺序）
+    x_cats, x_seen = [], set()
+    y_cats, y_seen = [], set()
+    for r in data:
+        xv = r.get("dim1_name") or r.get("dim1") or "-"
+        if xv not in x_seen:
+            x_cats.append(xv); x_seen.add(xv)
+        yv = r.get("dim2_name") or r.get("dim2") or "-"
+        if yv not in y_seen:
+            y_cats.append(yv); y_seen.add(yv)
+    # ECharts heatmap 需要 [x_index, y_index, value]
+    x_idx = {v: i for i, v in enumerate(x_cats)}
+    y_idx = {v: i for i, v in enumerate(y_cats)}
+    series_data = []
+    max_val = 0
+    for r in data:
+        xv = r.get("dim1_name") or r.get("dim1") or "-"
+        yv = r.get("dim2_name") or r.get("dim2") or "-"
+        v = r.get("value") or r.get("count") or 0
+        series_data.append([x_idx[xv], y_idx[yv], v])
+        if v > max_val:
+            max_val = v
+    title_obj = _base_title(suggestion, f"{dim1_zh} × {dim2_zh} 热力图")
+    option = {
+        "title": title_obj,
+        "tooltip": {"position": "top"},
+        "grid": {"left": 120, "right": 30, "bottom": 100, "top": 70},
+        "xAxis": {"type": "category", "data": x_cats, "splitArea": {"show": True},
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 10},
+                  "name": dim1_zh},
+        "yAxis": {"type": "category", "data": y_cats, "splitArea": {"show": True},
+                  "axisLabel": {"fontSize": 10}, "name": dim2_zh},
+        "visualMap": {"min": 0, "max": max_val or 1, "calculable": True,
+                      "orient": "horizontal", "left": "center", "bottom": 10,
+                      "inRange": {"color": ["#e6f7ff", "#69c0ff", "#1890ff", "#0050b3"]}},
+        "series": [{
+            "type": "heatmap", "data": series_data,
+            "label": {"show": False},
+            "emphasis": {"itemStyle": {"shadowBlur": 10, "shadowColor": "rgba(0,0,0,0.5)"}},
+        }],
+    }
+    return {"chart_type": "heatmap", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_payment_composition_option(intent, api_result, suggestion):
+    """5.1 payment-composition 饼图：key 为扇区，pct 为占比。"""
+    data = api_result.get("data", [])
+    group = intent.get("group", "payment1")
+    group_zh = P3_DIM_ZH.get(group, group)
+    meta = api_result.get("meta", {})
+    null_excluded = meta.get("null_excluded", 0)
+    pie_data = [{"name": r.get("key") or "-", "value": r.get("value") or r.get("count") or 0,
+                 "pct": r.get("pct")} for r in data]
+    sub_text = ""
+    if null_excluded:
+        sub_text = f"已排除 {null_excluded:,} 条无该层支付方式记录"
+    title_obj = _base_title(suggestion, f"{group_zh}构成")
+    if sub_text and "subtext" not in title_obj:
+        title_obj["subtext"] = sub_text
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "item",
+                    "formatter": "{b}<br/>人数/费用：{c}<br/>占比：{d}%"},
+        "legend": {"orient": "vertical", "left": "left", "top": "middle",
+                   "type": "scroll"},
+        "series": [{
+            "type": "pie", "radius": ["40%", "70%"], "center": ["60%", "55%"],
+            "label": {"formatter": "{b}\n{d}%"},
+            "data": pie_data,
+            "itemStyle": {"borderRadius": 6, "borderColor": "#fff", "borderWidth": 2},
+        }],
+    }
+    return {"chart_type": "pie", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_payment_cross_option(intent, api_result, suggestion):
+    """5.2 payment-cross 堆叠柱：X=key（9 类支付），系列=dim2。"""
+    data = api_result.get("data", [])
+    dim2 = intent.get("dim2", "age_group")
+    dim2_zh = P3_DIM_ZH.get(dim2, dim2)
+    metric = intent.get("metric", "count")
+    metric_zh = METRIC_ZH.get(metric, metric)
+    # 提取 X 轴（key）和系列（dim2_name）
+    x_cats, x_seen = [], set()
+    s_cats, s_seen = [], set()
+    for r in data:
+        k = r.get("key")
+        if k and k not in x_seen:
+            x_cats.append(k); x_seen.add(k)
+        s = r.get("dim2_name") or r.get("dim2")
+        if s and s not in s_seen:
+            s_cats.append(s); s_seen.add(s)
+    # 二维索引：{x: {series: value}}
+    idx = {k: {} for k in x_cats}
+    for r in data:
+        k, s = r.get("key"), r.get("dim2_name") or r.get("dim2")
+        if k in idx:
+            idx[k][s] = r.get("value") or r.get("count") or 0
+    series = []
+    for i, s in enumerate(s_cats):
+        series.append({
+            "type": "bar", "name": str(s), "stack": "cross",
+            "data": [idx[k].get(s, 0) for k in x_cats],
+            "itemStyle": {"color": COLORS[i % len(COLORS)]},
+            "emphasis": {"focus": "series"},
+        })
+    title_obj = _base_title(suggestion, f"支付方式 × {dim2_zh} 交叉分析")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {"top": 30, "data": [str(s) for s in s_cats], "type": "scroll"},
+        "grid": {"left": 70, "right": 30, "bottom": 90, "top": 80},
+        "xAxis": {"type": "category", "data": [str(k) for k in x_cats],
+                  "axisLabel": {"rotate": 30, "interval": 0, "fontSize": 10},
+                  "name": "支付方式"},
+        "yAxis": {"type": "value", "name": metric_zh},
+        "series": series,
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_sankey_option(intent, api_result, suggestion):
+    """5.3 sankey 桑葚图：直接消费 P3 返回的 nodes/links。"""
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):  # 容错：某些实现可能返回 list
+        raw = {"nodes": [], "links": []}
+    nodes = raw.get("nodes", [])
+    links = raw.get("links", [])
+    # 节点按 layer_index 着色
+    for n in nodes:
+        li = n.get("layer_index", 0)
+        n["itemStyle"] = {"color": SANKEY_LAYER_COLORS[li % len(SANKEY_LAYER_COLORS)]}
+        n["label"] = {"formatter": n.get("display") or n.get("name")}
+    title_obj = _base_title(suggestion, "支付流向桑葚图")
+    meta = api_result.get("meta", {})
+    null_excluded = meta.get("null_excluded", 0)
+    levels = meta.get("levels", "payment,payment2")
+    sub_text = ""
+    if null_excluded:
+        # 计算占比：null_excluded 占 (null_excluded + total) 的比例
+        total = meta.get("total_records", 0) or 0
+        if total + null_excluded:
+            kept_pct = total * 100.0 / (total + null_excluded)
+            sub_text = f"链路 {levels}：仅 {total:,} 条记录走完全程（占 {kept_pct:.1f}%）"
+    if sub_text and "subtext" not in title_obj:
+        title_obj["subtext"] = sub_text
+    option = {
+        "title": title_obj,
+        "tooltip": {"trigger": "item"},
+        "series": [{
+            "type": "sankey", "data": nodes, "links": links,
+            "emphasis": {"focus": "adjacency"},
+            "lineStyle": {"color": "gradient", "curveness": 0.5, "opacity": 0.5},
+            "label": {"fontSize": 11},
+            "layoutIterations": 32,
+        }],
+    }
+    return {"chart_type": "sankey", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_cost_relation_option(intent, api_result, suggestion):
+    """5.4 cost-relation 散点图：X=avg_costs，Y=avg_charges，气泡=count，颜色=ratio。"""
+    data = api_result.get("data", [])
+    by = intent.get("by", "payment")
+    by_zh = P3_DIM_ZH.get(by, by)
+    # 找 ratio 范围
+    ratios = [r.get("charge_cost_ratio") or 0 for r in data]
+    ratio_max = max(ratios) if ratios else 5
+    ratio_min = min(ratios) if ratios else 1
+    series_data = []
+    for r in data:
+        v = [
+            float(r.get("avg_costs") or 0),
+            float(r.get("avg_charges") or 0),
+            int(r.get("count") or 0),
+            float(r.get("charge_cost_ratio") or 0),
+            r.get("key") or r.get("name") or "-",
+        ]
+        series_data.append({"value": v, "name": v[4]})
+    title_obj = _base_title(suggestion, f"按{by_zh}看费用-成本关系")
+    option = {
+        "title": title_obj,
+        "tooltip": {"trigger": "item",
+                    "formatter": "{b}<br/>成本: {c[0]}<br/>费用: {c[1]}<br/>人数: {c[2]}<br/>费/本比: {c[3]}"},
+        "grid": {"left": 80, "right": 30, "bottom": 60, "top": 50},
+        "xAxis": {"type": "value", "name": "平均成本（元）", "scale": True},
+        "yAxis": {"type": "value", "name": "平均费用（元）", "scale": True},
+        "visualMap": {"show": True, "min": ratio_min, "max": max(ratio_max, ratio_min + 0.1),
+                      "dimension": 3, "calculable": True,
+                      "orient": "horizontal", "left": "center", "bottom": 5,
+                      "inRange": {"color": ["#52c41a", "#faad14", "#ff4d4f"]},
+                      "text": ["费用/成本比高", "低"]},
+        "series": [{
+            "type": "scatter", "data": series_data,
+            "symbolSize": 20,
+            "label": {"show": True, "position": "top", "formatter": "{b}",
+                      "fontSize": 10},
+            "emphasis": {"label": {"show": True}},
+        }],
+    }
+    # ECharts symbolSize 在 Python 端不好传 lambda，用预计算的 size 数组
+    counts = [int(r.get("count") or 0) for r in data]
+    cmax = max(counts) if counts else 1
+    series_data2 = []
+    for i, r in enumerate(data):
+        size = 10 + (counts[i] * 30.0 / cmax) if cmax else 10
+        series_data2.append({
+            "value": [float(r.get("avg_costs") or 0), float(r.get("avg_charges") or 0),
+                      counts[i], float(r.get("charge_cost_ratio") or 0)],
+            "name": r.get("key") or r.get("name") or "-",
+            "symbolSize": min(size, 60),
+        })
+    option["series"][0]["data"] = series_data2
+    return {"chart_type": "scatter", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_oop_burden_option(intent, api_result, suggestion):
+    """5.5 oop-burden 横向柱：X=key，Y=self_pay_pct（自付占比%）。"""
+    data = api_result.get("data", [])
+    dimension = intent.get("dimension", "disease")
+    dim_zh = P3_DIM_ZH.get(dimension, dimension)
+    mode = intent.get("mode", "selfpay1")
+    # 截断长名
+    name_limit = 25 if dimension == "disease" else 40
+    cats = [(str(r.get("key") or "-"))[:name_limit] for r in data]
+    pcts = [float(r.get("self_pay_pct") or 0) for r in data]
+    title_obj = _base_title(suggestion, f"按{dim_zh}看自付负担（{mode} 模式）")
+    option = {
+        "color": ["#fa8c16"],
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>自付占比: {c}%"},
+        "grid": {"left": 130, "right": 50, "bottom": 40, "top": 50},
+        "xAxis": {"type": "value", "name": "自付占比（%）", "axisLabel": {"formatter": "{value}%"}},
+        "yAxis": {"type": "category", "data": cats, "inverse": True,
+                  "axisLabel": {"fontSize": 10}},
+        "series": [{
+            "type": "bar", "name": "自付占比", "data": pcts, "barMaxWidth": 20,
+            "itemStyle": {"borderRadius": [0, 4, 4, 0]},
+            "label": {"show": True, "position": "right", "fontSize": 10,
+                      "formatter": "{c}%"},
+            "markPoint": {"data": [{"type": "max", "name": "最大负担"}]},
+        }],
+    }
+    # enriched data：把更多字段塞进 series.data，前端 tooltip 可自行扩展
+    enriched = []
+    for r in data:
+        enriched.append({
+            "value": float(r.get("self_pay_pct") or 0),
+            "self_pay_count": r.get("self_pay_count"),
+            "self_pay_avg_charges": r.get("self_pay_avg_charges"),
+            "self_pay_share_of_charges": r.get("self_pay_share_of_charges"),
+            "name": (str(r.get("key") or "-"))[:name_limit],
+        })
+    option["series"][0]["data"] = enriched
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_payment_summary_option(intent, api_result, suggestion):
+    """5.6 payment-summary KPI 卡片：用 dataset + 多 series-gauge 或纯文本。
+
+    由于 ECharts 没有原生"卡片"组件，这里用 graphic + 文本近似渲染。
+    返回 chart_type=kpi，前端可识别并改用 HTML 卡片渲染；如果前端没适配，
+    也能 fallback 到一个柱状图展示严重程度分布。
+    """
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):  # 容错
+        raw = {}
+    kpi_data = {
+        "total_records": raw.get("total_records", 0),
+        "total_charges": raw.get("total_charges", 0),
+        "total_costs": raw.get("total_costs", 0),
+        "avg_charges": raw.get("avg_charges", 0),
+        "avg_costs": raw.get("avg_costs", 0),
+        "avg_los": raw.get("avg_los", 0),
+        "self_pay_count": raw.get("self_pay_count", 0),
+        "self_pay_pct": raw.get("self_pay_pct", 0),
+        "top_payment": raw.get("top_payment", {}),
+        "ed_count": raw.get("ed_count", 0),
+    }
+    sev = raw.get("severity_distribution", {})
+    sev_data = [{"name": SEVERITY_ZH.get(k, k), "value": v, "color": SEVERITY_COLORS.get(k),
+                 "code": k}
+                for k, v in sev.items() if k in SEVERITY_ORDER]
+    # 按 Minor → Extreme 固定顺序排（用 code 字段反查 SEVERITY_ORDER，避免 next() 崩）
+    sev_data.sort(key=lambda x: SEVERITY_ORDER.index(x["code"]) if x["code"] in SEVERITY_ORDER else 99)
+    title_obj = _base_title(suggestion, "KPI 总览大屏")
+    # 用饼图展示严重程度分布作为主图（KPI 数字放 title 的 subtext）
+    pie_data = [{"name": d["name"], "value": d["value"]} for d in sev_data]
+    sub_lines = [
+        f"总记录 {kpi_data['total_records']:,} 条",
+        f"总费用 {kpi_data['total_charges']:,.0f} 元",
+        f"次均费用 {kpi_data['avg_charges']:,.2f} 元",
+        f"平均住院 {kpi_data['avg_los']} 天",
+        f"自付占比 {kpi_data['self_pay_pct']}%",
+    ]
+    if kpi_data["top_payment"]:
+        tp = kpi_data["top_payment"]
+        sub_lines.append(f"主要支付：{tp.get('key', '-')}（{tp.get('pct', 0)}%）")
+    title_obj["subtext"] = "\n".join(sub_lines)
+    title_obj["subtextStyle"] = {"fontSize": 11, "lineHeight": 16}
+    option = {
+        "color": [d["color"] for d in sev_data],
+        "title": title_obj,
+        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+        "legend": {"orient": "vertical", "left": "left", "top": "middle"},
+        "series": [{
+            "type": "pie", "radius": ["35%", "60%"], "center": ["65%", "55%"],
+            "label": {"formatter": "{b}\n{d}%"},
+            "data": pie_data,
+            "itemStyle": {"borderRadius": 6, "borderColor": "#fff", "borderWidth": 2},
+        }],
+    }
+    return {"chart_type": "kpi", "option": option, "kpi": kpi_data,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+# chart_hint → 图表构造函数路由表
+CHART_BUILDERS = {
+    "top_diagnoses":       _build_top_diagnoses_option,
+    "top_procedures":      _build_top_procedures_option,
+    "severity_profile":    _build_severity_profile_option,
+    "population_diff":     _build_population_diff_option,
+    "pyramid":             _build_pyramid_option,
+    "region_diff":         _build_region_diff_option,
+    "heatmap":             _build_heatmap_option,
+    "payment_composition": _build_payment_composition_option,
+    "payment_cross":       _build_payment_cross_option,
+    "sankey":              _build_sankey_option,
+    "cost_relation":       _build_cost_relation_option,
+    "oop_burden":          _build_oop_burden_option,
+    "payment_summary":     _build_payment_summary_option,
+}
+
+
 def generate_chart_config(intent: dict, api_result: dict, use_llm: bool = True) -> dict:
     """根据分析结果类型，生成美观、完整的 ECharts option 配置。
 
     架构：
       - 规则引擎：负责生成稳定、可渲染的 option 结构（核心）
       - LLM 辅助（可选）：给出图表类型建议 + 个性化标题 + 副标题
+
+    路由优先级：
+      1) chart_hint 命中 CHART_BUILDERS → 直接走 P3 新版专用构造器（13 种新图表）
+      2) 未命中 → 走旧版 metric 路由（pie/line/bar，向后兼容）
     """
+    # —— 路由1：chart_hint 命中 P3 新接口专用图表构造器 ——
+    chart_hint = intent.get("chart_hint")
+    if chart_hint and chart_hint in CHART_BUILDERS:
+        # LLM 标题建议仍然调用（让标题更生动），但 chart_type 不取 LLM 的（专用图表固定）
+        suggestion = {}
+        if use_llm and LLM_ENABLED:
+            try:
+                # 复用旧 LLM：它会返回 title/subtitle/chart_type，我们只取 title/subtitle
+                # 用 P3 维度翻译更友好
+                p3_dim_zh = (P3_DIM_ZH.get(chart_hint, "")
+                             or DIMENSION_ZH.get(intent.get("dimension", ""), "维度"))
+                p3_metric_zh = METRIC_ZH.get(intent.get("metric", ""), intent.get("metric", ""))
+                # 给 LLM 一条空 data（P3 数据可能很大，不必全部塞进 prompt）
+                sample = (api_result.get("data", []) or [])[:3]
+                suggestion = _suggest_chart_by_llm(intent, p3_dim_zh, p3_metric_zh, sample)
+            except Exception:
+                suggestion = {}
+        try:
+            return CHART_BUILDERS[chart_hint](intent, api_result, suggestion)
+        except Exception as e:
+            # 兜底：专用构造器异常时降级到旧版 metric 路由（保证总有图出）
+            print(f"[CHART BUILDER ERROR] {chart_hint}: {e}，降级到旧版 metric 路由")
+
+    # —— 路由2：旧版 metric 路由（pie/line/bar）—— 向后兼容
     data = api_result.get("data", [])
     metric = intent["metric"]
     metric_zh = METRIC_ZH.get(metric, metric)
@@ -1614,10 +3163,154 @@ def _fallback_report_template(sections_meta: list[dict], total_records: int,
     }
 
 
+# chart_hint → 报告 section 标题中文名（用于报告展示，比 dimension 更直观）
+CHART_HINT_TITLE_ZH = {
+    "top_diagnoses":       "Top 诊断排行",
+    "top_procedures":      "Top 手术排行",
+    "severity_profile":    "病重程度构成",
+    "population_diff":    "人群分布差异",
+    "pyramid":            "人口金字塔",
+    "region_diff":        "地区分布差异",
+    "heatmap":            "诊断×维度热力图",
+    "payment_composition": "支付方式构成",
+    "payment_cross":      "支付×维度交叉",
+    "sankey":             "支付流向桑葚图",
+    "cost_relation":      "费用-成本关系",
+    "oop_burden":         "自付负担分析",
+    "payment_summary":    "KPI 总览大屏",
+}
+
+
+def _extract_topn_keyvalue(item: dict, chart_hint: str | None = None) -> tuple[str, object]:
+    """从 P3 数据项中提取 (key, value)，按 chart_hint 选择字段优先级。
+
+    不同 chart_hint 的数据结构差异较大：
+      - top_diagnoses/top_procedures: {code, name, value/count}
+      - severity_profile: {group, severity, value/count}      → key = "group/severity_zh"
+      - population_diff/region_diff/payment_composition: {key, value/count, pct?}
+      - pyramid: {age_group, male, female, total}             → value = total
+      - heatmap: {dim1_name/dim1, dim2_name/dim2, value/count} → key = "x × y"
+      - payment_cross: {key, dim2_name/dim2, value/count}      → key = "key × dim2"
+      - cost_relation: {key, charge_cost_ratio, avg_charges...} → value = ratio
+      - oop_burden: {key, self_pay_count, self_pay_pct}        → value = self_pay_count
+      - sankey/payment_summary: data 是 dict 不是 list，不应调用本函数
+    """
+    if not isinstance(item, dict):
+        return ("-", 0)
+
+    if chart_hint == "severity_profile":
+        g = item.get("group") or "-"
+        s = item.get("severity") or "-"
+        key = f"{g}/{SEVERITY_ZH.get(s, s)}"
+        value = item.get("value") or item.get("count") or 0
+    elif chart_hint == "pyramid":
+        key = item.get("age_group") or "-"
+        m, f = item.get("male", 0) or 0, item.get("female", 0) or 0
+        value = item.get("total") or (m + f)
+    elif chart_hint == "heatmap":
+        x = item.get("dim1_name") or item.get("dim1") or "-"
+        y = item.get("dim2_name") or item.get("dim2") or "-"
+        key = f"{x} × {y}"
+        value = item.get("value") or item.get("count") or 0
+    elif chart_hint == "payment_cross":
+        k = item.get("key") or "-"
+        s = item.get("dim2_name") or item.get("dim2") or "-"
+        key = f"{k} × {s}"
+        value = item.get("value") or item.get("count") or 0
+    elif chart_hint == "cost_relation":
+        key = item.get("key") or "-"
+        value = item.get("charge_cost_ratio") or 0
+    elif chart_hint == "oop_burden":
+        key = item.get("key") or "-"
+        value = item.get("self_pay_count") or 0
+    else:
+        # 通用：top_diagnoses/top_procedures/population_diff/region_diff/payment_composition/旧路由
+        key = (item.get("name") or item.get("key") or item.get("payment")
+               or item.get("year") or "-")
+        value = (item.get("value") or item.get("pct")
+                 or item.get("count") or 0)
+    return (key, value)
+
+
+def _build_section_findings(chart_hint: str | None, data, meta: dict) -> list[str]:
+    """生成 report section 的 key_findings（Top3 或特殊结构）。
+
+    返回最多 3 条字符串。处理 3 种情形：
+      1) sankey: data 是 dict {nodes, links}，提取 Top3 流向
+      2) payment_summary: data 是 dict (KPI 大屏)，提取关键 KPI
+      3) 其他: data 是 list，按 chart_hint 走 _extract_topn_keyvalue 取 Top3 + ratio
+    """
+    findings: list[str] = []
+
+    # —— 特殊 1：sankey 的 data 是 dict（nodes/links）——
+    if chart_hint == "sankey":
+        raw = data if isinstance(data, dict) else {}
+        links = raw.get("links", []) or []
+        top_links = sorted(links, key=lambda l: l.get("value") or 0, reverse=True)[:3]
+        for j, lk in enumerate(top_links):
+            src = lk.get("source", "-")
+            tgt = lk.get("target", "-")
+            # 去掉 layer 前缀让展示更友好（"支付1|Medicare" → "Medicare"）
+            if "|" in src:
+                src = src.split("|", 1)[1]
+            if "|" in tgt:
+                tgt = tgt.split("|", 1)[1]
+            v = lk.get("value", 0) or 0
+            findings.append(f"第{j+1}大流向：「{src}」→「{tgt}」流量 {v:,}")
+        return findings
+
+    # —— 特殊 2：payment_summary 的 data 是 dict（KPI 大屏）——
+    if chart_hint == "payment_summary":
+        if not isinstance(data, dict) or not data:
+            return findings
+        findings.append(f"总记录 {data.get('total_records', 0):,} 条 · "
+                        f"总费用 {data.get('total_charges', 0):,.0f} 元")
+        findings.append(f"次均费用 {data.get('avg_charges', 0):,.2f} 元 / "
+                        f"次均成本 {data.get('avg_costs', 0):,.2f} 元 / "
+                        f"平均住院 {data.get('avg_los', 0)} 天")
+        sp_count = data.get("self_pay_count", 0) or 0
+        sp_pct = data.get("self_pay_pct", 0) or 0
+        tp = data.get("top_payment") or {}
+        tp_str = f" · 主要支付「{tp.get('key', '-')}」({tp.get('pct', 0)}%)" if tp else ""
+        findings.append(f"自付 {sp_count:,} 人（{sp_pct}%）{tp_str}")
+        return findings
+
+    # —— 通用：data 是 list，按 chart_hint 取 Top3 ——
+    if not isinstance(data, list) or not data:
+        return findings
+
+    top_n = min(3, len(data))
+    for j in range(top_n):
+        item = data[j]
+        key, value = _extract_topn_keyvalue(item, chart_hint)
+        # 计算 ratio = 当前 / 下一名
+        v1 = value
+        v2 = None
+        if j + 1 < len(data):
+            _, v2 = _extract_topn_keyvalue(data[j + 1], chart_hint)
+        # 格式化 value
+        if isinstance(value, float):
+            v_str = f"{value:,.2f}"
+        elif isinstance(value, int):
+            v_str = f"{value:,}"
+        else:
+            v_str = str(value)
+        if v2:
+            try:
+                ratio = float(v1) / float(v2) if v2 else 1
+                findings.append(
+                    f"排名第{j+1}的是「{key}」，指标值为 {v_str}，是第二名的 {ratio:.2f} 倍"
+                )
+            except (TypeError, ZeroDivisionError, ValueError):
+                findings.append(f"排名第{j+1}的是「{key}」，指标值为 {v_str}")
+        else:
+            findings.append(f"排名第{j+1}的是「{key}」，指标值为 {v_str}")
+    return findings
+
+
 def generate_insight_report(single_result: dict = None, multi_results: list = None,
                             use_llm: bool = True) -> dict:
     """基于分析结果生成结构化医疗洞察报告。
-
     两种使用场景：
       a) single_result：针对单个分析结果生成简要报告（用户问完后自动生成）
       b) multi_results：整合多个维度分析结果，生成完整报告（Dashboard 大屏用）
@@ -1644,52 +3337,57 @@ def generate_insight_report(single_result: dict = None, multi_results: list = No
         api_result = r.get("api_result", r) if isinstance(r, dict) else {}
         data = api_result.get("data", [])
         meta = api_result.get("meta", {})
-        if not data:
+
+        # 从 r.intent 读 chart_hint（用于走专用字段提取和标题生成）
+        chart_hint = None
+        if isinstance(r, dict):
+            _intent = r.get("intent")
+            if isinstance(_intent, dict):
+                chart_hint = _intent.get("chart_hint")
+
+        # sankey 和 payment_summary 的 data 是 dict（不是 list），
+        # 既不是空也不能按 list 走 Top3 逻辑，统一交给 _build_section_findings 处理
+        is_dict_data = chart_hint in ("sankey", "payment_summary")
+        if (is_dict_data and not data) or (not is_dict_data and not data):
             continue
+
         dim_code = meta.get("dimension", "-")
         metric_code = meta.get("metric", "-")
-        dim_zh = DIMENSION_ZH.get(dim_code, dim_code)
+        # chart_hint 命中时优先用 CHART_HINT_TITLE_ZH（更直观），否则降级到 dimension_zh
+        if chart_hint and chart_hint in CHART_HINT_TITLE_ZH:
+            section_dim_zh = CHART_HINT_TITLE_ZH[chart_hint]
+            dim_zh = section_dim_zh
+        else:
+            dim_zh = DIMENSION_ZH.get(dim_code, dim_code)
+            section_dim_zh = dim_zh
         metric_zh = METRIC_ZH.get(metric_code, metric_code)
         records = meta.get("total_records", 0) or 0
         total_records += records
 
-        # Top 3 发现（先用规则生成一份保底）
-        rule_findings = []
-        for j in range(min(3, len(data))):
-            item = data[j]
-            key = item.get("key") or item.get("payment") or item.get("year") or "-"
-            value = item.get("value") or item.get("pct") or item.get("count") or 0
-            v1 = value
-            v2 = data[j + 1].get("value") if j + 1 < len(data) else None
-            v2 = v2 or (data[j + 1].get("pct") if j + 1 < len(data) else None)
-            v2 = v2 or (data[j + 1].get("count") if j + 1 < len(data) else None)
-            if v2:
-                try:
-                    ratio = float(v1) / float(v2) if v2 else 1
-                    rule_findings.append(
-                        f"排名第{j+1}的是「{key}」，指标值为 {value}，是第二名的 {ratio:.2f} 倍"
-                    )
-                except (TypeError, ZeroDivisionError):
-                    rule_findings.append(f"排名第{j+1}的是「{key}」，指标值为 {value}")
-            else:
-                rule_findings.append(f"排名第{j+1}的是「{key}」，指标值为 {value}")
+        # 关键发现（先用规则生成一份保底；sankey/payment_summary 走专用分支）
+        rule_findings = _build_section_findings(chart_hint, data, meta)
+
+        # data_sample：list 取前 10 项；dict（sankey/summary）整体给前端
+        data_sample = data[:10] if isinstance(data, list) else data
 
         report["sections"].append({
-            "section_title": f"分析维度 {i+1}：{dim_zh}",
+            "section_title": f"分析维度 {i+1}：{section_dim_zh}",
             "key_findings": rule_findings,
             "chart_type": r.get("chart", {}).get("chart_type") if isinstance(r, dict) and "chart" in r else "bar",
-            "data": data[:10],
+            "data": data_sample,
             "meta": {
                 "dimension": dim_code,
                 "metric": metric_code,
                 "dimension_zh": dim_zh,
                 "metric_zh": metric_zh,
                 "total_records": records,
+                "chart_hint": chart_hint,
             },
         })
         sections_meta.append({
             "dim": dim_zh, "metric": metric_zh, "records": records,
             "top3": rule_findings,
+            "chart_hint": chart_hint,
         })
 
     sections_count = len(report["sections"])
@@ -2259,9 +3957,54 @@ if __name__ == "__main__":
     elif not _DOTENV_HINT:
         print(f"[dotenv] ℹ️ 未找到 .env 文件，全部配置从系统环境变量读取")
     if "--selftest" in sys.argv:
+        # 综合离线自测：路由表 + 图表 + 摘要 + 报告 4 套测试一起跑
+        # 用样例数据，不依赖 LLM/P3，适合 CI 和本地健康检查
+        import subprocess as _sp
+        print("=" * 70)
+        print("[本地自测] 综合离线测试套件（不依赖 LLM/P3）")
+        print(f"  INTENT_CACHE_VERSION = {INTENT_CACHE_VERSION!r}（旧缓存将自动失效）")
+        print(f"  LLM_ENABLED = {LLM_ENABLED}")
+        print("=" * 70)
+        _test_files = [
+            "test_route_table.py",      # 19 例：13 chart_hint 路由 + 2 多轮 + 3 反例
+            "test_chart_builders.py",   # 13 例：13 种 chart_hint 的 ECharts option 构造
+            "test_summary_builders.py", # 13 例：13 种 chart_hint 的中文摘要
+            "test_report_builders.py",  # 15 例：13 种 chart_hint + 2 旧用例的报告 section
+        ]
+        _all_passed = True
+        for _t in _test_files:
+            print(f"\n>>> 运行 {_t}")
+            print("-" * 70)
+            try:
+                _r = _sp.run(
+                    [sys.executable, _t],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                )
+                if _r.returncode != 0:
+                    _all_passed = False
+                    print(f"  ❌ {_t} 退出码 {_r.returncode}")
+                else:
+                    print(f"  ✅ {_t} 通过")
+            except FileNotFoundError:
+                print(f"  ⚠️  {_t} 不存在，跳过")
+            except Exception as _e:
+                _all_passed = False
+                print(f"  ❌ {_t} 执行异常：{type(_e).__name__}: {_e}")
+        print("\n" + "=" * 70)
+        if _all_passed:
+            print(f"[自测] ✅ 全部 {len(_test_files)} 套测试通过")
+            print(f"[自测] ✅ INTENT_CACHE_VERSION={INTENT_CACHE_VERSION!r} 已就绪，旧缓存会自动失效")
+        else:
+            print(f"[自测] ❌ 有失败用例，请查看上方输出")
+            sys.exit(1)
+    elif "--selftest-e2e" in sys.argv:
+        # 端到端自测：走真实 LLM + P3，需要服务可用
         q = "2021年哪类疾病的平均住院时长最长？前5名"
         print("=" * 60)
-        print(f"[本地自测] 问题：{q}")
+        print(f"[端到端自测] 问题：{q}")
+        print(f"  LLM_ENABLED = {LLM_ENABLED}  LLM_MODEL_ID = {LLM_MODEL_ID}")
+        print(f"  ANALYSIS_API = {ANALYSIS_API}")
         print("=" * 60)
         result = handle_question(q, with_report=True)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -2274,9 +4017,10 @@ if __name__ == "__main__":
         print(f"   会话列表：GET  http://127.0.0.1:{port}/api/conversations")
         print(f"   历史详情：GET  http://127.0.0.1:{port}/api/conversation/history?conversation_id=xxx")
         print(f"   依赖 P3 服务：{ANALYSIS_API}")
-        print(f"   本地自测命令：python agent.py --selftest")
+        print(f"   本地自测命令：python agent.py --selftest（离线）/ --selftest-e2e（端到端）")
         print(f"   CORS 白名单：{CORS_ORIGINS}")
         print(f"   会话存储：{SESSION_BACKEND}")
+        print(f"   意图缓存版本：{INTENT_CACHE_VERSION}（升级路由表后旧缓存自动失效）")
         llm_status = "✅ 已启用" if LLM_ENABLED else "❌ 未启用（请检查 LLM_API_KEY 环境变量）"
         print(f"   LLM 状态：{llm_status}")
         if LLM_ENABLED:
