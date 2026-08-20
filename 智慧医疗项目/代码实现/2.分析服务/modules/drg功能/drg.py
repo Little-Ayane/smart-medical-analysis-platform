@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
-from src.drg.drg_service import drg_service
+from drg_service import drg_service
 
 # 创建路由器
 router = APIRouter(prefix="/api/v1/drg", tags=["DRG分析"])
@@ -297,7 +297,7 @@ async def drg_summary(filters: Optional[Dict[str, Any]] = None):
 async def health_check():
     """DRG服务健康检查"""
     try:
-        from src.dao.mysql_dao import mysql_dao
+        from mysql_dao import mysql_dao
         db_status = "healthy" if mysql_dao.test_connection() else "unhealthy"
 
         return {
