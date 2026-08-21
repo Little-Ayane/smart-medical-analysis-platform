@@ -14,10 +14,12 @@ CASES = [
     ("2021年住院人数最多的前3种疾病是什么？",
      "top_diagnoses", {"metric": "count", "top": 3}),
     ("常见疾病有哪些",
-     "top_diagnoses", {"metric": "count"}),
+     "top_diagnoses", {"metric": "count", "top": 20}),  # BUG 2.2 回归：默认 top=20
     # —— top_procedures ——
     ("前5种高频手术是什么",
      "top_procedures", {"metric": "count", "top": 5}),
+    ("高频手术有哪些",
+     "top_procedures", {"metric": "count", "top": 20}),  # BUG 2.2 回归：默认 top=20
     # —— severity_profile ——
     ("按年龄段看严重程度构成",
      "severity_profile", {"by": "age_group", "metric": "count"}),
