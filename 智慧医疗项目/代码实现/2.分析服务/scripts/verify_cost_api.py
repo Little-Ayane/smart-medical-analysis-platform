@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 纪志鹏 · cost 接口验证脚本
-运行环境：能连到 smart_health 且已装 flask / pymysql / flask-cors 的机器（即 VM，
-          因为 common.DB 的 host=127.0.0.1，应用须与 MySQL 同机运行）。
+运行环境：能访问 smart_health 库（common.DB host=192.168.111.141:3306）且已装
+          flask / pymysql / flask-cors 的机器（内网 VM，需能连到该 MySQL）。
 
 用法：
-  cd 2.分析服务
+  cd 2.分析服务/scripts
   python verify_cost_api.py            # 真实连库测试（依赖 smart_health 已导入 CSV 数据）
   python verify_cost_api.py --mock     # 用假数据验证逻辑/路由/信封，不连库（适合先确认代码无误）
 
 退出码：全部通过=0，有失败=1
 """
+import os
 import sys
+
+# 脚本已移到 scripts/ 子目录，把项目根目录（2.分析服务）加入 sys.path，
+# 保证能 import common / app / modules.*（真实模式与 --mock 模式都依赖）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ---- mock 模式：必须在 import app 之前 patch 查询函数 ----
 if "--mock" in sys.argv:

@@ -31,17 +31,37 @@
 ## 启动方式
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+# 安装依赖（依赖清单合并至服务根目录 2.分析服务/requirements.txt）
+pip install -r ../requirements.txt
 
-# 配置环境变量（复制模板后编辑）
-cp .env.example .env
+# 配置环境变量（模板在服务根目录，本目录不再自带）
+cp ../.env.example .env
 
-# 启动服务
+# 方式一：本目录启动（main.py 会自动挂载共享底座 fastapi_common/）
 python main.py
+
+# 方式二：从服务根目录以 uvicorn 启动
+cd ../.. && uvicorn modules.core.main:app --host 0.0.0.0 --port 8000
 ```
 
 服务默认运行在 `http://localhost:8000`
+
+## 目录结构
+
+```
+2.分析服务/
+├── fastapi_common/      # 共享底座：数据库连接、DAO、SQL 构建等（core 与 drg 共用）
+└── modules/core/        # 本模块专属代码
+    ├── main.py          # FastAPI 入口（启动时挂载 fastapi_common/ 到 sys.path）
+    ├── analysis.py      # API 路由层
+    ├── analysis_service.py
+    ├── etl_aggregate.py / etl_aggregate.sh / etl_sync.sh
+    ├── README.md
+    └── API文档.md
+```
+
+`database.py / base_dao.py / mysql_dao.py / hive_dao.py / dao_factory.py / sql_builder.py /
+sql_dialect.py / agg_api.py / agg_service.py` 均已上移至 `fastapi_common/`，本目录不再保留副本。
 
 ## 环境变量
 

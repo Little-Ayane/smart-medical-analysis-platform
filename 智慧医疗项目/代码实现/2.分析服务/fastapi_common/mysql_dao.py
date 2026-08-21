@@ -13,7 +13,7 @@ import os
 import hashlib
 from datetime import datetime, timedelta
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fastapi_common 目录（平级导入 database/base_dao）
 
 from database import db_config
 from base_dao import BaseDAO

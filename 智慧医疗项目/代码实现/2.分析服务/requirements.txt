@@ -1,4 +1,16 @@
-# P3 分析服务依赖（智慧医疗项目/.venv 已安装）
+# P3 分析服务依赖（Flask 主服务 + core/drg FastAPI 服务）
 flask>=3.0
 pymysql>=2.0
 requests>=2.31
+
+# FastAPI 服务（modules/core 端口8000 / modules/drg 端口8001，共享底座 fastapi_common/）
+fastapi>=0.104.1
+uvicorn>=0.24.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+
+# 可选：Hive 数据源（FastAPI 服务 DATA_SOURCE=hive 时才需要）
+# pyhive[hive]>=0.7.0
+# thrift>=0.16.0
+# sasl>=0.3.1
+# pure-sasl>=0.6.2

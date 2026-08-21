@@ -8,8 +8,11 @@ import uvicorn
 import sys
 import os
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 导入路径引导：本服务目录（平级 import analysis/agg_api）+ 共享底座 fastapi_common
+# 支持两种启动方式：cd modules/core && python main.py 或 从分析服务根 uvicorn modules.core.main:app
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(_here)), "fastapi_common"))
 
 from analysis import router as analysis_router
 from agg_api import router as agg_router

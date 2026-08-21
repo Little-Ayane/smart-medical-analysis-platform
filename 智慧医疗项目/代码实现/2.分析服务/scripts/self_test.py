@@ -251,6 +251,59 @@ def test_cache():
           r1["data"] == r2["data"] and r1["meta"]["total_records"] == r2["meta"]["total_records"])
 
 
+# ------------------------------------------------------------
+# 模块四 医疗质量监测
+# ------------------------------------------------------------
+def test_quality():
+    r = get("/api/v1/quality/overview")
+    check("quality/overview: KPI 字段齐全",
+          r["code"] == 0 and isinstance(r["data"], dict) and all(
+              k in r["data"] for k in
+              ("total_records", "deaths", "mortality_rate", "avg_los", "ed_rate",
+               "ama_rate", "transfer_rate", "newborns", "lbw_rate",
+               "avg_charges", "avg_costs")), str(r)[:200])
+    check("quality/overview: 比率在 0-100 区间",
+          all(0 <= r["data"][k] <= 100 for k in
+              ("mortality_rate", "ed_rate", "ama_rate", "transfer_rate")),
+          str(r["data"]))
+
+    r2 = get("/api/v1/quality/mortality", {"dimension": "diagnosis", "top": 5})
+    check("quality/mortality: 结构 {key,name,count,deaths,mortality_rate}",
+          r2["code"] == 0 and r2["data"] and all(
+              all(k in d for k in ("key", "name", "count", "deaths", "mortality_rate"))
+              for d in r2["data"]), str(r2)[:200])
+    check("quality/mortality: 按死亡率降序",
+          r2["data"] == sorted(r2["data"], key=lambda d: -d["mortality_rate"]),
+          str(r2["data"][:3]))
+
+    r3 = get("/api/v1/quality/length-of-stay",
+             {"dimension": "facility", "min_cases": 200})
+    check("quality/length-of-stay: 结构 {key,name,count,avg_los}",
+          r3["code"] == 0 and r3["data"] and all(
+              all(k in d for k in ("key", "name", "count", "avg_los"))
+              for d in r3["data"]), str(r3)[:200])
+    check("quality/length-of-stay: 分母 >= min_cases",
+          all(d["count"] >= 200 for d in r3["data"]), str(r3["data"]))
+
+    r4 = get("/api/v1/quality/facility-ranking", {"top": 10, "min_cases": 100})
+    check("quality/facility-ranking: 医院多指标齐全",
+          r4["code"] == 0 and r4["data"] and all(
+              all(k in d for k in ("key", "name", "county", "count",
+                                   "mortality_rate", "avg_los", "ed_rate",
+                                   "ama_rate", "transfer_rate", "newborns",
+                                   "lbw_rate", "avg_charges", "avg_costs"))
+              for d in r4["data"]), str(r4)[:200])
+
+    r5 = get("/api/v1/quality/disposition")
+    check("quality/disposition: 结构 {key,count,pct} 且 pct 合计 ≈ 100",
+          r5["code"] == 0 and r5["data"] and all(
+              all(k in d for k in ("key", "count", "pct")) for d in r5["data"])
+          and abs(sum(d["pct"] for d in r5["data"]) - 100) < 1, str(r5)[:200])
+
+    r6 = get("/api/v1/quality/mortality", {"dimension": "nonsense"})
+    check("quality/mortality: 非法 dimension -> 400", r6["code"] == 400, str(r6)[:200])
+
+
 def test_legacy():
     r = get("/api/v1/health")
     check("旧接口: /health 正常", r["code"] == 0 and r["data"]["db"] == "connected", str(r))
@@ -287,9 +340,10 @@ def main():
     test_meta()
     test_filters()
     test_cache()
+    test_quality()
     test_legacy()
 
-    print(f"\n{'=' * 50}\n共 {18} 组用例，失败 {len(FAILED)} 组: {FAILED or '无'}")
+    print(f"\n{'=' * 50}\n共 {19} 组用例，失败 {len(FAILED)} 组: {FAILED or '无'}")
     sys.exit(1 if FAILED else 0)
 
 

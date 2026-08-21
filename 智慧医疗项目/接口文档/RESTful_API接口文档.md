@@ -1,6 +1,10 @@
 # 大数据分析服务模块 — RESTful API 接口文档
 
 > 版本：v1.0 | 服务框架：Flask | 基础路径：`/api/v1` | 数据格式：JSON（UTF-8）
+>
+> **以实际代码为准**：标注「规划中/未实现」的接口尚未在代码中落地，部分能力已由
+> `modules/` 下新接口替代（病种手术分析见《病种手术与支付分析接口文档》）。
+> 当前已实现的接口：2.1 健康检查、2.2 聚合分析、2.5 支付方式占比、2.7 疾病趋势。
 
 ## 一、通用约定
 
@@ -107,6 +111,8 @@ GET /api/v1/analysis/aggregate?dimension=age_group&metric=total_charges&year=202
 
 ### 2.3 平均住院时长分析
 
+> ⚠️ 规划中/未实现。平均住院日排行已由 `/api/v1/quality/length-of-stay` 提供。
+
 ```
 GET /api/v1/analysis/length-of-stay?dimension=ccsr_diagnosis&top=10
 ```
@@ -119,6 +125,8 @@ GET /api/v1/analysis/length-of-stay?dimension=ccsr_diagnosis&top=10
 ---
 
 ### 2.4 费用分布分析
+
+> ⚠️ 规划中/未实现。费用分布可由 `/api/v1/analysis/aggregate`（metric=total_charges/avg_charges/avg_costs）或 `/api/v1/cost/*` 替代。
 
 ```
 GET /api/v1/analysis/charges?dimension=discharge_year
@@ -149,6 +157,8 @@ GET /api/v1/analysis/payment-mix?year=2021
 
 ### 2.6 Top N 疾病诊断统计
 
+> ⚠️ 规划中/未实现。诊断排行已由 `/api/v1/disease/top-diagnoses` 提供（返回 code+name，能力更强）。
+
 ```
 GET /api/v1/analysis/top-diagnoses?top=10&year=2021
 ```
@@ -175,6 +185,8 @@ GET /api/v1/analysis/trend?dimension=discharge_year&diagnosis=INF012
 
 ### 2.8 多维度交叉分析
 
+> ⚠️ 规划中/未实现。维度交叉已由 `/api/v1/disease/heatmap`（dim1 × dim2 白名单）与 `/api/v1/payment/cross` 提供。
+
 支持两个维度交叉（如 年龄段 × 年份）。
 
 ```
@@ -192,6 +204,8 @@ GET /api/v1/analysis/cross?dim1=age_group&dim2=discharge_year&metric=count
 ---
 
 ### 2.9 自然语言查询（AI 智能交互入口）
+
+> ⚠️ 规划中/未实现。当前意图解析在 P4 AI 模块（3.AI交互/agent.py）内完成，直接调用上述分析接口，不经由此端点。
 
 由 AI 智能交互模块调用，后端将自然语言解析后的意图参数传入。
 
