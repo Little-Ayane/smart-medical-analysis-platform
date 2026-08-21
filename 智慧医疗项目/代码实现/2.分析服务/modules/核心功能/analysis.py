@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
-from src.core.analysis_service import analysis_service
+from analysis_service import analysis_service
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 

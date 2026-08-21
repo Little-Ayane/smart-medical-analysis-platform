@@ -1,6 +1,7 @@
 """
 分析服务层
 负责业务逻辑处理和结果格式化
+支持 MySQL / Hive 多数据源
 """
 from typing import List, Dict, Any, Optional
 import sys
@@ -8,34 +9,30 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from src.dao.mysql_dao import mysql_dao
-from src.query.sql_builder import sql_builder, QueryConfig, DIMENSION_MAP, METRIC_MAP
+from dao_factory import get_dao
+from sql_builder import sql_builder, QueryConfig, DIMENSION_MAP, METRIC_MAP
+from sql_dialect import SQLDialect
 
 
 class AnalysisService:
     """分析服务类"""
 
-    def __init__(self):
-        self.dao = mysql_dao
+    def __init__(self, data_source: str = None):
+        self.dao = get_dao(data_source)
         self.builder = sql_builder
+        self.dialect = self.dao.get_dialect()
+
+    def _exec(self, sql: str, params: tuple = None,
+              use_cache: bool = True) -> List[Dict[str, Any]]:
+        """执行查询（自动适配方言）"""
+        sql = SQLDialect.adapt(sql, self.dialect)
+        return self.dao.execute_query(sql, params, use_cache)
 
     def dimension_combine(self, dimensions: List[str], metrics: List[str],
                           filters: Dict[str, Any] = None,
                           sort: Dict[str, str] = None,
                           limit: int = 100) -> Dict[str, Any]:
-        """
-        维度组合选择
-
-        Args:
-            dimensions: 维度列表
-            metrics: 指标列表
-            filters: 筛选条件
-            sort: 排序配置
-            limit: 返回条数
-
-        Returns:
-            查询结果
-        """
+        """维度组合选择"""
         # 验证参数
         invalid_dims = self.builder.validate_dimensions(dimensions)
         if invalid_dims:
@@ -45,7 +42,6 @@ class AnalysisService:
         if invalid_metrics:
             raise ValueError(f"无效的指标: {invalid_metrics}")
 
-        # 构建查询配置
         config = QueryConfig(
             dimensions=dimensions,
             metrics=metrics,
@@ -54,38 +50,24 @@ class AnalysisService:
             limit=limit
         )
 
-        # 执行查询
         sql, params = self.builder.build_aggregate_query(config)
-        results = self.dao.execute_query(sql, tuple(params))
+        results = self._exec(sql, tuple(params))
 
-        # 格式化结果
         return {
             "columns": dimensions + metrics,
             "rows": results,
             "total": len(results),
-            "sql": sql  # 调试用，生产环境可移除
+            "sql": sql
         }
 
     def metric_switch(self, dimensions: List[str],
                       metric_groups: Dict[str, List[str]],
                       filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        指标切换
-
-        Args:
-            dimensions: 维度列表
-            metric_groups: 指标组
-            filters: 筛选条件
-
-        Returns:
-            查询结果
-        """
-        # 验证参数
+        """指标切换"""
         invalid_dims = self.builder.validate_dimensions(dimensions)
         if invalid_dims:
             raise ValueError(f"无效的维度: {invalid_dims}")
 
-        # 收集所有指标
         all_metrics = []
         for group_name, metrics in metric_groups.items():
             for metric in metrics:
@@ -96,7 +78,6 @@ class AnalysisService:
         if invalid_metrics:
             raise ValueError(f"无效的指标: {invalid_metrics}")
 
-        # 构建查询配置
         config = QueryConfig(
             dimensions=dimensions,
             metrics=all_metrics,
@@ -104,20 +85,17 @@ class AnalysisService:
             sort={"field": all_metrics[0] if all_metrics else "cases", "order": "desc"}
         )
 
-        # 执行查询
         sql, params = self.builder.build_aggregate_query(config)
-        results = self.dao.execute_query(sql, tuple(params))
+        results = self._exec(sql, tuple(params))
 
         # 按指标组重新组织结果
         formatted_results = []
         for row in results:
             formatted_row = {}
-            # 添加维度值
             for dim in dimensions:
                 _, _, alias = DIMENSION_MAP[dim]
                 formatted_row[alias] = row.get(alias)
 
-            # 按指标组添加指标值
             for group_name, metrics in metric_groups.items():
                 formatted_row[group_name] = {}
                 for metric in metrics:
@@ -135,20 +113,7 @@ class AnalysisService:
     def drill_down(self, current_level: str, current_value: Any,
                    drill_to: str, metrics: List[str],
                    filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        逐级下钻
-
-        Args:
-            current_level: 当前层级
-            current_value: 当前值
-            drill_to: 下钻目标层级
-            metrics: 指标列表
-            filters: 筛选条件
-
-        Returns:
-            下钻结果
-        """
-        # 验证参数
+        """逐级下钻"""
         if current_level not in DIMENSION_MAP:
             raise ValueError(f"无效的当前层级: {current_level}")
         if drill_to not in DIMENSION_MAP:
@@ -158,7 +123,6 @@ class AnalysisService:
         if invalid_metrics:
             raise ValueError(f"无效的指标: {invalid_metrics}")
 
-        # 构建下钻查询
         drill_filters = filters.copy() if filters else {}
         drill_filters[current_level] = current_value
 
@@ -166,9 +130,7 @@ class AnalysisService:
             current_level, current_value, drill_to, metrics, drill_filters
         )
 
-        results = self.dao.execute_query(sql, tuple(params))
-
-        # 获取面包屑导航
+        results = self._exec(sql, tuple(params))
         breadcrumb = self._get_breadcrumb(current_level, current_value)
 
         return {
@@ -184,38 +146,20 @@ class AnalysisService:
     def time_rollup(self, time_level: str, metrics: List[str],
                     filters: Dict[str, Any] = None,
                     compare_previous: bool = False) -> Dict[str, Any]:
-        """
-        时间上卷
-
-        Args:
-            time_level: 时间层级 (year, quarter, month)
-            metrics: 指标列表
-            filters: 筛选条件
-            compare_previous: 是否与上期对比
-
-        Returns:
-            时间上卷结果
-        """
-        # 验证参数
+        """时间上卷"""
         invalid_metrics = self.builder.validate_metrics(metrics)
         if invalid_metrics:
             raise ValueError(f"无效的指标: {invalid_metrics}")
 
-        # 构建查询
-        sql, params = self.builder.build_time_rollup_query(
-            time_level, metrics, filters
-        )
+        sql, params = self.builder.build_time_rollup_query(time_level, metrics, filters)
+        results = self._exec(sql, tuple(params))
 
-        results = self.dao.execute_query(sql, tuple(params))
-
-        # 如果需要与上期对比，计算增长率
         if compare_previous and len(results) > 1:
             for i in range(1, len(results)):
                 for metric in metrics:
                     _, _, alias = METRIC_MAP[metric]
                     current_value = results[i].get(alias, 0)
                     previous_value = results[i-1].get(alias, 0)
-
                     if previous_value and previous_value != 0:
                         growth_rate = ((current_value - previous_value) / previous_value) * 100
                         results[i][f"{alias}_growth_rate"] = round(growth_rate, 2)
@@ -231,19 +175,7 @@ class AnalysisService:
 
     def pivot(self, row_dimension: str, col_dimension: str,
               metric: str, filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        交叉透视
-
-        Args:
-            row_dimension: 行维度
-            col_dimension: 列维度
-            metric: 指标
-            filters: 筛选条件
-
-        Returns:
-            透视表结果
-        """
-        # 验证参数
+        """交叉透视"""
         if row_dimension not in DIMENSION_MAP:
             raise ValueError(f"无效的行维度: {row_dimension}")
         if col_dimension not in DIMENSION_MAP:
@@ -251,35 +183,27 @@ class AnalysisService:
         if metric not in METRIC_MAP:
             raise ValueError(f"无效的指标: {metric}")
 
-        # 构建查询
         sql, params = self.builder.build_pivot_query(
             row_dimension, col_dimension, metric, filters
         )
+        results = self._exec(sql, tuple(params))
 
-        results = self.dao.execute_query(sql, tuple(params))
-
-        # 转换为透视表格式
         _, _, row_alias = DIMENSION_MAP[row_dimension]
         _, _, col_alias = DIMENSION_MAP[col_dimension]
         _, _, metric_alias = METRIC_MAP[metric]
 
-        # 提取唯一的行和列值
         row_values = sorted(list(set(row.get(row_alias) for row in results)))
         col_values = sorted(list(set(row.get(col_alias) for row in results)))
 
-        # 构建矩阵
+        # 用dict索引替代O(n²)循环
+        lookup = {}
+        for r in results:
+            key = (r.get(row_alias), r.get(col_alias))
+            lookup[key] = r.get(metric_alias)
+
         matrix = []
         for row_val in row_values:
-            row_data = []
-            for col_val in col_values:
-                # 查找对应的值
-                value = None
-                for result in results:
-                    if (result.get(row_alias) == row_val and
-                            result.get(col_alias) == col_val):
-                        value = result.get(metric_alias)
-                        break
-                row_data.append(value)
+            row_data = [lookup.get((row_val, col_val)) for col_val in col_values]
             matrix.append(row_data)
 
         return {
@@ -293,38 +217,20 @@ class AnalysisService:
 
     def summary(self, metrics: List[str],
                 filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        汇总统计
-
-        Args:
-            metrics: 指标列表
-            filters: 筛选条件
-
-        Returns:
-            汇总统计结果
-        """
-        # 验证参数
+        """汇总统计"""
         invalid_metrics = self.builder.validate_metrics(metrics)
         if invalid_metrics:
             raise ValueError(f"无效的指标: {invalid_metrics}")
 
-        # 构建查询
         sql, params = self.builder.build_summary_query(metrics, filters)
-
-        result = self.dao.execute_query(sql, tuple(params))
+        result = self._exec(sql, tuple(params))
 
         if result:
             return result[0]
         return {}
 
     def get_metadata(self) -> Dict[str, Any]:
-        """
-        获取元数据
-
-        Returns:
-            维度和指标的元数据
-        """
-        # 获取维度信息
+        """获取元数据"""
         dimensions = {}
         for dim_name, (table, column, alias) in DIMENSION_MAP.items():
             try:
@@ -345,7 +251,6 @@ class AnalysisService:
                     "count": 0
                 }
 
-        # 获取指标信息
         metrics = {}
         for metric_name, (func, column, alias) in METRIC_MAP.items():
             metrics[metric_name] = {
@@ -354,23 +259,19 @@ class AnalysisService:
                 "alias": alias
             }
 
-        return {
-            "dimensions": dimensions,
-            "metrics": metrics
-        }
+        return {"dimensions": dimensions, "metrics": metrics}
 
     def _get_breadcrumb(self, current_level: str, current_value: Any) -> List[str]:
         """获取面包屑导航"""
-        # 简单实现，可以根据需要扩展
         return [str(current_value)]
 
     def health_check(self) -> Dict[str, Any]:
         """健康检查"""
         db_status = "healthy" if self.dao.test_connection() else "unhealthy"
-
         return {
             "status": "healthy" if db_status == "healthy" else "degraded",
             "database": db_status,
+            "datasource": self.dialect,
             "timestamp": self._get_timestamp()
         }
 
@@ -380,5 +281,5 @@ class AnalysisService:
         return datetime.now().isoformat()
 
 
-# 全局服务实例
+# 全局服务实例（默认MySQL）
 analysis_service = AnalysisService()

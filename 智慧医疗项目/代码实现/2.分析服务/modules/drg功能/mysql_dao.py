@@ -1,7 +1,9 @@
 """
 MySQL数据访问层
-负责数据库连接管理和基础查询操作
+负责MySQL数据库连接管理和查询操作
+实现 BaseDAO 接口，支持通过 DAOFactory 切换数据源
 """
+import time
 import pymysql
 from pymysql.cursors import DictCursor
 from contextlib import contextmanager
@@ -9,29 +11,27 @@ from typing import List, Dict, Any, Optional
 import sys
 import os
 import hashlib
-import json
 from datetime import datetime, timedelta
 
-# 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from config.database import db_config
+from database import db_config
+from base_dao import BaseDAO
 
 
 class QueryCache:
-    """简单查询缓存"""
+    """简单查询缓存（带大小上限）"""
 
-    def __init__(self, ttl_seconds=300):  # 默认5分钟缓存
+    def __init__(self, ttl_seconds=300, max_size=500):
         self.cache = {}
         self.ttl = ttl_seconds
+        self.max_size = max_size
 
     def get_key(self, sql, params):
-        """生成缓存键"""
         content = f"{sql}:{params}"
         return hashlib.md5(content.encode()).hexdigest()
 
     def get(self, sql, params):
-        """获取缓存"""
         key = self.get_key(sql, params)
         if key in self.cache:
             data, timestamp = self.cache[key]
@@ -42,21 +42,38 @@ class QueryCache:
         return None
 
     def set(self, sql, params, data):
-        """设置缓存"""
         key = self.get_key(sql, params)
+        # 缓存满时清理最旧的条目
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache, key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
         self.cache[key] = (data, datetime.now())
 
     def clear(self):
-        """清空缓存"""
         self.cache.clear()
 
 
-class MySQLDAO:
+class MySQLDAO(BaseDAO):
     """MySQL数据访问对象"""
 
     def __init__(self):
         self.config = db_config
-        self.cache = QueryCache(ttl_seconds=300)  # 5分钟缓存
+        self.cache = QueryCache(ttl_seconds=300, max_size=500)
+        self._pool = []
+        self._pool_size = getattr(self.config, 'pool_size', 10)
+
+    def connect(self):
+        """建立连接（由连接池管理）"""
+        pass
+
+    def close(self):
+        """关闭所有连接"""
+        for conn in self._pool:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._pool.clear()
 
     @contextmanager
     def get_connection(self):
@@ -98,24 +115,27 @@ class MySQLDAO:
                 finally:
                     cursor.close()
 
-    def execute_query(self, sql: str, params: tuple = None, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def execute_query(self, sql: str, params: tuple = None,
+                      use_cache: bool = True) -> List[Dict[str, Any]]:
         """执行查询SQL，返回结果列表"""
-        # 检查缓存
         if use_cache:
             cached = self.cache.get(sql, params)
             if cached is not None:
                 return cached
 
-        # 执行查询
+        start = time.time()
         with self.get_cursor() as cursor:
             cursor.execute(sql, params)
             result = cursor.fetchall()
 
-            # 存入缓存
-            if use_cache:
-                self.cache.set(sql, params, result)
+        elapsed = (time.time() - start) * 1000
+        if elapsed > 1000:
+            print(f"[慢查询] {elapsed:.0f}ms | {sql[:120]}...")
 
-            return result
+        if use_cache:
+            self.cache.set(sql, params, result)
+
+        return result
 
     def execute_scalar(self, sql: str, params: tuple = None) -> Any:
         """执行查询SQL，返回单个值"""
@@ -138,42 +158,10 @@ class MySQLDAO:
             affected_rows = cursor.executemany(sql, params_list)
             return affected_rows
 
-    def table_exists(self, table_name: str) -> bool:
-        """检查表是否存在"""
-        sql = """
-        SELECT COUNT(*) as cnt
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = %s
-        """
-        result = self.execute_scalar(sql, (self.config.database, table_name))
-        return result > 0
-
-    def get_table_columns(self, table_name: str) -> List[str]:
-        """获取表的所有列名"""
-        sql = """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position
-        """
-        results = self.execute_query(sql, (self.config.database, table_name))
-        return [row['column_name'] for row in results]
-
     def get_table_count(self, table_name: str) -> int:
         """获取表的记录数"""
         sql = f"SELECT COUNT(*) as cnt FROM {table_name}"
         return self.execute_scalar(sql)
-
-    def get_all_tables(self) -> List[str]:
-        """获取数据库中所有表名"""
-        sql = """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s
-        ORDER BY table_name
-        """
-        results = self.execute_query(sql, (self.config.database,))
-        return [row['table_name'] for row in results]
 
     def get_dimension_values(self, table_name: str, column_name: str,
                              distinct: bool = True) -> List[Any]:
@@ -195,6 +183,15 @@ class MySQLDAO:
             print(f"连接测试失败: {e}")
             return False
 
+    def get_dialect(self) -> str:
+        return "mysql"
 
-# 全局DAO实例
+    def supports_index(self) -> bool:
+        return True
+
+    def supports_transaction(self) -> bool:
+        return True
+
+
+# 全局DAO实例（兼容旧代码）
 mysql_dao = MySQLDAO()

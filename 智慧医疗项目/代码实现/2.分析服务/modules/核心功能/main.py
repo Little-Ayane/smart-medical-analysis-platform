@@ -12,6 +12,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analysis import router as analysis_router
+from agg_api import router as agg_router
 from database import app_config
 
 # 创建FastAPI应用
@@ -34,6 +35,7 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(analysis_router)
+app.include_router(agg_router)
 
 
 # 根路由
