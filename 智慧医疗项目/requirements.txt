@@ -13,5 +13,7 @@ requests==2.34.2         # P4 agent.py 调用分析 API 使用
 pyspark==3.5.4           # 对应 Spark 3.5.4-bin-hadoop3
 redis==5.0.8             # redis-py，P3 二期缓存
 langchain==0.2.16
+langchain-core==0.2.39    # StructuredTool / ChatPromptTemplate / Messages
 langchain-community==0.2.16
 langchain-openai==0.1.25
+pydantic==2.5.3           # StructuredTool args_schema BaseModel

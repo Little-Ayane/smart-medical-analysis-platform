@@ -21,9 +21,9 @@ from flask.json.provider import DefaultJSONProvider
 # 数据库连接
 # ------------------------------------------------------------
 DB = {
-    "host": "127.0.0.1",
+    "host": "192.168.111.141",
     "user": "root",
-    "password": "",
+    "password": "root",
     "database": "smart_health",
     "charset": "utf8mb4",
 }

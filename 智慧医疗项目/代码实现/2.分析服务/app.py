@@ -7,6 +7,7 @@ P3 · 大数据分析服务模块
 运行：python app.py  ->  http://127.0.0.1:5000
 注意：进程内缓存依赖单进程模型，请勿用 debug=True（reloader 双进程会让缓存各自为政）。
 """
+
 import json
 import time
 from functools import wraps
@@ -15,11 +16,14 @@ import pymysql
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
-from common import apply_json_provider
+from common import apply_json_provider, get_conn as _common_get_conn
 from meta import meta_bp
 from modules.disease import disease_bp
 from modules.payment import payment_bp
 
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app)  # ← 加这一行，允许所有来源跨域
 app = Flask(__name__)
 apply_json_provider(app)
 app.register_blueprint(disease_bp)
@@ -55,9 +59,8 @@ def on_unhandled(e):
 # 数据库连接
 # ------------------------------------------------------------
 def get_conn():
-    return pymysql.connect(host="127.0.0.1", user="root", password="",
-                           database="smart_health", charset="utf8mb4",
-                           cursorclass=pymysql.cursors.DictCursor)
+    # 复用 common.get_conn（统一读取 common.DB，避免密码散落多处导致 health/aggregate 等老接口连库失败）
+    return _common_get_conn()
 
 
 # ------------------------------------------------------------
@@ -225,6 +228,13 @@ def health():
         db_status = "error"
     return jsonify(envelope({"status": "ok", "db": db_status}, query_ms=1))
 
+# ===== 注册骆志远的路由 =====
+from luo_routes import register_luo_routes
+register_luo_routes(app)
+
+# ===== 注册纪志鹏的费用成本路由（modules/cost）=====
+from modules.cost import register_cost_routes
+register_cost_routes(app)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
