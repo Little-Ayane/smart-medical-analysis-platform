@@ -618,6 +618,15 @@ CHART_HINT_KEYWORDS = {
     "成本效益": "efficiency_ranking", "效益排行": "efficiency_ranking", "效益排名": "efficiency_ranking",
     "费用构成": "composition", "费用占比": "composition", "费用组成": "composition",
     "费用趋势": "cost_trend", "年度费用": "cost_trend", "费用走势": "cost_trend", "历年费用": "cost_trend",
+    # —— 医疗质量监测（模块四 /api/v1/quality/*）——
+    "医疗质量": "quality_overview", "质量总览": "quality_overview",
+    "质量概览": "quality_overview", "质量指标": "quality_overview",
+    "死亡率排行": "quality_mortality", "死亡率排名": "quality_mortality",
+    "死亡排行": "quality_mortality", "死亡率": "quality_mortality",
+    "平均住院日": "quality_los", "住院日排行": "quality_los",
+    "医院质量对比": "quality_facility", "医院质量": "quality_facility",
+    "质量对比": "quality_facility",
+    "离院去向": "quality_disposition", "出院去向": "quality_disposition",
 }
 
 # P4 metric → P3 新接口 metric 翻译表（解决命名差异：P4 用 avg_length_of_stay，P3 新接口用 avg_los）
@@ -1660,6 +1669,33 @@ def _infer_chart_hint_params(intent: dict, question: str = "") -> None:
     elif hint == "top_procedures":
         if not intent.get("top"):
             intent["top"] = 20
+    elif hint in ("quality_mortality", "quality_los"):
+        # dimension: diagnosis / facility / age_group / severity / risk_mortality
+        dim = intent.get("dimension")
+        if dim and dim in _QUALITY_DIM_MAP:
+            intent["dimension"] = _QUALITY_DIM_MAP[dim]
+        else:
+            # P4 未命中合法维度 → 从问句关键词二次推断（含 risk_mortality）
+            if "风险" in q:
+                intent["dimension"] = "risk_mortality"
+            elif "医院" in q or "机构" in q:
+                intent["dimension"] = "facility"
+            elif "年龄" in q:
+                intent["dimension"] = "age_group"
+            elif "严重" in q or "病情" in q:
+                intent["dimension"] = "severity"
+            else:
+                intent["dimension"] = "diagnosis"
+        if not intent.get("top"):
+            intent["top"] = 20
+    elif hint == "quality_facility":
+        # 固定 facility 维度，只补 top 默认 15（医院名长）
+        if not intent.get("top"):
+            intent["top"] = 15
+    elif hint == "quality_overview":
+        pass  # 无业务参数，只接受 filters
+    elif hint == "quality_disposition":
+        pass  # 无业务参数，只接受 filters
 
 
 def _parse_intent_by_rules(question: str, history: list[dict]) -> dict:
@@ -2091,6 +2127,56 @@ def _build_cost_trend_params(intent: dict) -> dict:
     return params
 
 
+# 医疗质量监测模块维度命名空间：P4 dimension → P3 quality dimension。
+# 注意 facility 在 quality 命名空间仍是 facility（不同于 DIM_TO_P3_DIM 的 service_area 映射）。
+_QUALITY_DIM_MAP = {
+    "ccsr_diagnosis": "diagnosis",
+    "diagnosis": "diagnosis",
+    "facility": "facility",
+    "age_group": "age_group",
+    "severity": "severity",
+    "risk_mortality": "risk_mortality",
+}
+
+
+def _norm_quality_dimension(dim):
+    """把 P4/P3 两套 dimension 统一到 quality 白名单，非法值回退 diagnosis。"""
+    if dim not in _QUALITY_DIM_MAP:
+        return "diagnosis"
+    return _QUALITY_DIM_MAP[dim]
+
+
+def _build_quality_overview_params(intent: dict) -> dict:
+    return {}  # overview 只接受 filters，无业务参数
+
+
+def _build_quality_mortality_params(intent: dict) -> dict:
+    return {
+        "dimension": _norm_quality_dimension(intent.get("dimension")),
+        "top": min(intent.get("top", 20), 100),
+        "min_cases": min(max(intent.get("min_cases", 30), 1), 10000),
+    }
+
+
+def _build_quality_los_params(intent: dict) -> dict:
+    return {
+        "dimension": _norm_quality_dimension(intent.get("dimension")),
+        "top": min(intent.get("top", 20), 100),
+        "min_cases": min(max(intent.get("min_cases", 30), 1), 10000),
+    }
+
+
+def _build_quality_facility_params(intent: dict) -> dict:
+    return {
+        "top": min(intent.get("top", 15), 100),
+        "min_cases": min(max(intent.get("min_cases", 100), 1), 10000),
+    }
+
+
+def _build_quality_disposition_params(intent: dict) -> dict:
+    return {}  # disposition 只接受 filters，无业务参数
+
+
 # 路由表：chart_hint → P3 新接口端点 + 参数构造函数 + 超时
 ROUTE_TABLE = {
     # —— 模块一：病种与手术分析（7 个）——
@@ -2116,6 +2202,12 @@ ROUTE_TABLE = {
     "efficiency_ranking":  {"endpoint": "/cost/efficiency-ranking",  "build": _build_cost_efficiency_ranking_params,  "timeout": 60},
     "composition":         {"endpoint": "/cost/composition",         "build": _build_cost_composition_params,         "timeout": 60},
     "cost_trend":          {"endpoint": "/cost/trend",               "build": _build_cost_trend_params,               "timeout": 60},
+    # —— 模块四：医疗质量监测（5 个，/api/v1/quality/*）——
+    "quality_overview":    {"endpoint": "/quality/overview",         "build": _build_quality_overview_params,    "timeout": 15},
+    "quality_mortality":   {"endpoint": "/quality/mortality",        "build": _build_quality_mortality_params,   "timeout": 15},
+    "quality_los":         {"endpoint": "/quality/length-of-stay",   "build": _build_quality_los_params,         "timeout": 15},
+    "quality_facility":    {"endpoint": "/quality/facility-ranking", "build": _build_quality_facility_params,    "timeout": 15},
+    "quality_disposition": {"endpoint": "/quality/disposition",      "build": _build_quality_disposition_params, "timeout": 15},
 }
 # 注：/api/v1/meta/dimensions 不在路由表（由前端启动时直接调用，不经 P4）
 
@@ -2202,6 +2294,11 @@ def call_analysis_api(intent: dict, question: str = "", use_llm_validate: bool =
                 "sankey": None,
                 "cost_relation": None,       # by 才是有效维度
                 "oop_burden": {"disease", "age_group", "county"},
+                "quality_overview": None,    # 全局 KPI 卡片，不接受 dimension
+                "quality_mortality": {"diagnosis", "facility", "age_group", "severity", "risk_mortality"},
+                "quality_los": {"diagnosis", "facility", "age_group", "severity", "risk_mortality"},
+                "quality_facility": {"facility"},  # 固定医院维度（避免误报"维度被忽略"）
+                "quality_disposition": None, # 全局饼图，不接受 dimension
             }
             expected = expected_dims.get(chart_hint)
             if expected is None and chart_hint in expected_dims:
@@ -2324,7 +2421,7 @@ P3_DIM_ZH = {
     "diagnosis": "疾病诊断", "procedure": "手术术式",
     "age_group": "年龄段", "gender": "性别", "severity": "严重程度",
     "payment": "支付方式", "service_area": "服务区", "county": "区县",
-    "facility": "医院",
+    "facility": "医院", "risk_mortality": "死亡风险",
     # severity_profile 的 by 取值
     "medical_surgical": "医疗/外科",
     # payment_composition 的 group 取值
@@ -4873,6 +4970,161 @@ def _build_cost_option(intent, api_result, suggestion):
             "_suggestion_source": "llm" if suggestion else "rules"}
 
 
+def _build_quality_overview_option(intent, api_result, suggestion):
+    """4.1 quality-overview 质量 KPI 大屏：数字卡片 + 各质量比率柱状图。"""
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):  # 容错
+        raw = {}
+    kpi_data = {
+        "total_records": raw.get("total_records", 0),
+        "deaths": raw.get("deaths", 0),
+        "mortality_rate": raw.get("mortality_rate", 0),
+        "avg_los": raw.get("avg_los", 0),
+        "ed_rate": raw.get("ed_rate", 0),
+        "ama_rate": raw.get("ama_rate", 0),
+        "transfer_rate": raw.get("transfer_rate", 0),
+        "newborns": raw.get("newborns", 0),
+        "lbw_rate": raw.get("lbw_rate"),
+        "avg_charges": raw.get("avg_charges", 0),
+        "avg_costs": raw.get("avg_costs", 0),
+    }
+    title_obj = _base_title(suggestion, "医疗质量 KPI 总览")
+    sub_lines = [
+        f"总出院 {kpi_data['total_records']:,} 条 · 死亡 {kpi_data['deaths']:,} 人",
+        f"死亡率 {kpi_data['mortality_rate']}% · 平均住院 {kpi_data['avg_los']} 天",
+        f"急诊率 {kpi_data['ed_rate']}% · 转院率 {kpi_data['transfer_rate']}%",
+        f"次均费用 {kpi_data['avg_charges']:,.2f} 元 / 成本 {kpi_data['avg_costs']:,.2f} 元",
+    ]
+    title_obj["subtext"] = "\n".join(sub_lines)
+    title_obj["subtextStyle"] = {"fontSize": 11, "lineHeight": 16}
+    # 主图：各质量比率柱状图（大屏直观可视化）
+    rate_items = [
+        ("死亡率", kpi_data["mortality_rate"] or 0),
+        ("急诊率", kpi_data["ed_rate"] or 0),
+        ("AMA率", kpi_data["ama_rate"] or 0),
+        ("转院率", kpi_data["transfer_rate"] or 0),
+    ]
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 50, "top": 120},
+        "xAxis": {"type": "category", "data": [k for k, _ in rate_items]},
+        "yAxis": {"type": "value", "name": "比率（%）"},
+        "series": [{
+            "type": "bar", "name": "比率", "barMaxWidth": 60,
+            "data": [v for _, v in rate_items],
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "kpi", "option": option, "kpi": kpi_data,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_mortality_option(intent, api_result, suggestion):
+    """4.2 quality-mortality 死亡率排行柱状图：X=name，Y=mortality_rate（%）。"""
+    data = api_result.get("data", [])
+    cats = [r.get("name") or r.get("key") or "-" for r in data]
+    vals = [r.get("mortality_rate") or 0 for r in data]
+    title_obj = _base_title(suggestion, "死亡率排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>死亡率: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "维度"},
+        "yAxis": {"type": "value", "name": "死亡率（%）"},
+        "series": [{
+            "type": "bar", "name": "死亡率", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#ff4d4f"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_los_option(intent, api_result, suggestion):
+    """4.3 quality-length-of-stay 平均住院日排行柱状图：X=name，Y=avg_los。"""
+    data = api_result.get("data", [])
+    cats = [r.get("name") or r.get("key") or "-" for r in data]
+    vals = [r.get("avg_los") or 0 for r in data]
+    title_obj = _base_title(suggestion, "平均住院日排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>平均住院日: {c} 天"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "维度"},
+        "yAxis": {"type": "value", "name": "平均住院日（天）"},
+        "series": [{
+            "type": "bar", "name": "平均住院日", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#1e6fd9"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}天"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_facility_option(intent, api_result, suggestion):
+    """4.4 quality-facility-ranking 医院死亡率对比柱状图（按死亡率降序）。"""
+    data = api_result.get("data", [])
+    # API 原返回按出院量降序，这里按死亡率降序重排，突出"质量对比"视角
+    rows = sorted(data, key=lambda r: r.get("mortality_rate") or 0, reverse=True)
+    cats = [r.get("name") or r.get("key") or "-" for r in rows]
+    vals = [r.get("mortality_rate") or 0 for r in rows]
+    title_obj = _base_title(suggestion, "医院死亡率对比")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>死亡率: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 40, "interval": 0, "fontSize": 10},
+                  "name": "医院"},
+        "yAxis": {"type": "value", "name": "死亡率（%）"},
+        "series": [{
+            "type": "bar", "name": "死亡率", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#ff4d4f"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_disposition_option(intent, api_result, suggestion):
+    """4.5 quality-disposition 离院去向构成饼图。"""
+    data = api_result.get("data", [])
+    pie_data = [{"name": r.get("key") or "-", "value": r.get("count") or 0}
+                for r in data]
+    title_obj = _base_title(suggestion, "离院去向构成")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+        "legend": {"orient": "vertical", "left": "left", "top": "middle"},
+        "series": [{
+            "type": "pie", "radius": ["35%", "65%"], "center": ["65%", "55%"],
+            "label": {"formatter": "{b}\n{d}%"},
+            "data": pie_data,
+            "itemStyle": {"borderRadius": 6, "borderColor": "#fff", "borderWidth": 2},
+        }],
+    }
+    return {"chart_type": "pie", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
 CHART_BUILDERS = {
     "top_diagnoses":       _build_top_diagnoses_option,
     "top_procedures":      _build_top_procedures_option,
@@ -4893,6 +5145,11 @@ CHART_BUILDERS = {
     "efficiency_ranking":  _build_cost_option,
     "composition":         _build_cost_option,
     "cost_trend":          _build_cost_option,
+    "quality_overview":    _build_quality_overview_option,
+    "quality_mortality":   _build_quality_mortality_option,
+    "quality_los":         _build_quality_los_option,
+    "quality_facility":    _build_quality_facility_option,
+    "quality_disposition": _build_quality_disposition_option,
 }
 
 
@@ -5143,6 +5400,11 @@ CHART_HINT_TITLE_ZH = {
     "efficiency_ranking": "成本效益排行",
     "composition":        "费用构成",
     "cost_trend":         "费用年度趋势",
+    "quality_overview":   "医疗质量总览",
+    "quality_mortality":  "死亡率排行",
+    "quality_los":        "平均住院日排行",
+    "quality_facility":   "医院质量对比",
+    "quality_disposition": "离院去向构成",
 }
 
 # chart_hint → 常见图表类型（给 /api/meta/dimensions 的能力目录做静态提示；
@@ -5211,6 +5473,18 @@ def _extract_topn_keyvalue(item: dict, chart_hint: str | None = None) -> tuple[s
     elif chart_hint == "oop_burden":
         key = item.get("key") or "-"
         value = item.get("self_pay_count") or 0
+    elif chart_hint == "quality_mortality":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("mortality_rate") or 0
+    elif chart_hint == "quality_los":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("avg_los") or 0
+    elif chart_hint == "quality_facility":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("count") or 0
+    elif chart_hint == "quality_disposition":
+        key = item.get("key") or "-"
+        value = item.get("count") or 0
     else:
         # 通用：top_diagnoses/top_procedures/population_diff/region_diff/payment_composition/旧路由
         key = (item.get("name") or item.get("key") or item.get("payment")
@@ -5261,6 +5535,19 @@ def _build_section_findings(chart_hint: str | None, data, meta: dict) -> list[st
         tp = data.get("top_payment") or {}
         tp_str = f" · 主要支付「{tp.get('key', '-')}」({tp.get('pct', 0)}%)" if tp else ""
         findings.append(f"自付 {sp_count:,} 人（{sp_pct}%）{tp_str}")
+        return findings
+
+    # —— 特殊 3：quality_overview 的 data 是 dict（质量 KPI 大屏）——
+    if chart_hint == "quality_overview":
+        if not isinstance(data, dict) or not data:
+            return findings
+        findings.append(f"总出院 {data.get('total_records', 0):,} 条 · "
+                        f"院内死亡 {data.get('deaths', 0):,} 人")
+        findings.append(f"死亡率 {data.get('mortality_rate', 0)}% / "
+                        f"平均住院 {data.get('avg_los', 0)} 天")
+        findings.append(f"急诊率 {data.get('ed_rate', 0)}% / "
+                        f"非医嘱离院率 {data.get('ama_rate', 0)}% / "
+                        f"转院率 {data.get('transfer_rate', 0)}%")
         return findings
 
     # —— 通用：data 是 list，按 chart_hint 取 Top3 ——
@@ -5333,9 +5620,9 @@ def generate_insight_report(single_result: dict = None, multi_results: list = No
             if isinstance(_intent, dict):
                 chart_hint = _intent.get("chart_hint")
 
-        # sankey 和 payment_summary 的 data 是 dict（不是 list），
+        # sankey / payment_summary / quality_overview 的 data 是 dict（不是 list），
         # 既不是空也不能按 list 走 Top3 逻辑，统一交给 _build_section_findings 处理
-        is_dict_data = chart_hint in ("sankey", "payment_summary")
+        is_dict_data = chart_hint in ("sankey", "payment_summary", "quality_overview")
         if (is_dict_data and not data) or (not is_dict_data and not data):
             continue
 
