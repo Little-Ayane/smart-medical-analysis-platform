@@ -1,0 +1,20 @@
+Q: 哪些病种的住院成本效益最高？
+intent_source: langchain_agent
+chart_hint: efficiency_ranking  chart_type: bar
+
+----- answer (user-facing, reliable) -----
+📋 针对您的问题「哪些病种的住院成本效益最高？」，共分析 **2,109,327** 条住院记录。
+📊 成本效益排行，结果如下：
+  🥇 「RESPIRATORY DISTRESS SYNDROME」：386.46（274 例）
+  🥈 「Neonatal acidemia and hypoxia」：373.97（21 例）
+  🥉 「ESSENTIAL HYPERTENSION」：373.30（689 例）
+  4. 「OTHER SPECIFIED AND UNSPECIFIED PERINATAL CONDITIONS」：349.84（943 例）
+  5. 「Neonatal abstinence syndrome」：349.00（45 例）
+⏱️ 本次查询耗时 32726 ms。
+
+----- agent_output (LangChain free-form, hallucination risk) -----
+根据数据分析，住院成本效益最高的病种包括呼吸窘迫综合征（Respiratory Distress Syndrome），其利润率高达386.46%，平均费用为254,154.3元，总费用为69,638,277.77元。紧随其后的是新生儿酸中毒和缺氧（Neonatal acidemia and hypoxia），利润率为373.97%，平均费用为43,354.95元，总费用为910,453.91元。第三位是原发性高血压（Essential Hypertension），利润率为373.3%，平均费用为48,618.22元，总费用为33,497,950.34元。这些病种的高利润率表明它们在住院治疗中具有较高的经济效益。
+
+此外，其他高效益病种还包括新生儿戒断综合征（Neonatal abstinence syndrome）、斜视（Strabismus）、短妊娠期、低出生体重和胎儿生长迟缓（Short gestation; low birth weight; and fetal growth retardation）等。这些病种的利润率均超过340%，显示出较强的盈利能力。💡
+
+建议医院可以进一

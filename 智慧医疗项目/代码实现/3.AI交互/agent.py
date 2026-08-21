@@ -164,7 +164,7 @@ else:
 
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -231,6 +231,17 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.siliconflow.cn/v1").rstrip
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+
+# —— Agent（工具调用）专用模型 ——
+# 可单独指定一个 function-calling 更稳的模型，不影响摘要等其它 LLM 调用。
+# 默认与 LLM_MODEL_ID 一致。硅基流动上 function-calling 较稳的候选（按需切换，注意各自配额/价格）：
+#   - Qwen/Qwen2.5-72B-Instruct  （默认，已支持 tools）
+#   - deepseek-ai/DeepSeek-V3
+#   - Pro/Qwen/Qwen2.5-72B-Instruct  （Pro 版更稳定，需 Pro 额度）
+LLM_MODEL_ID_AGENT = os.getenv("LLM_MODEL_ID_AGENT", LLM_MODEL_ID)
+# 工具调用提取失败时的重试次数（每次重新让 Agent 走一遍工具选择），
+# 用于应对模型偶发返回空工具调用/乱码。默认 1（即最多 2 次尝试）。
+AGENT_TOOL_RETRIES = max(0, int(os.getenv("AGENT_TOOL_RETRIES", "1")))
 
 # 给日志/健康检查用的标记
 LLM_ENABLED = bool(LLM_API_KEY)
@@ -600,6 +611,13 @@ CHART_HINT_KEYWORDS = {
     "疾病top": "top_diagnoses", "常见疾病": "top_diagnoses", "高发疾病": "top_diagnoses",
     "手术排行": "top_procedures", "手术top": "top_procedures",
     "常见手术": "top_procedures", "高频手术": "top_procedures", "手术谱": "top_procedures",
+    # —— 费用成本分析（新接口 /cost/*）——
+    "费用成本差": "profit_difference", "成本差": "profit_difference",
+    "收支差额": "profit_difference", "费用减成本": "profit_difference",
+    "利润率": "profit_margin", "利润": "profit_margin", "收费成本比": "profit_margin",
+    "成本效益": "efficiency_ranking", "效益排行": "efficiency_ranking", "效益排名": "efficiency_ranking",
+    "费用构成": "composition", "费用占比": "composition", "费用组成": "composition",
+    "费用趋势": "cost_trend", "年度费用": "cost_trend", "费用走势": "cost_trend", "历年费用": "cost_trend",
 }
 
 # P4 metric → P3 新接口 metric 翻译表（解决命名差异：P4 用 avg_length_of_stay，P3 新接口用 avg_los）
@@ -1662,6 +1680,11 @@ def _parse_intent_by_rules(question: str, history: list[dict]) -> dict:
             intent["chart_hint"] = CHART_HINT_KEYWORDS[kw]
             break
 
+    # 兜底：问句含「费用」+「构成」但「费用构成」非连续（如"住院费用按医院是怎么构成的"），
+    # 归到费用构成端点，避免被指标匹配误判为通用聚合（/analysis/aggregate）。
+    if not intent["chart_hint"] and "费用" in question and "构成" in question:
+        intent["chart_hint"] = "composition"
+
     # 指标匹配（优先匹配更长关键词）
     for kw in sorted(METRIC_KEYWORDS, key=len, reverse=True):
         if kw in question:
@@ -2011,6 +2034,63 @@ def _build_top_procedures_params(intent: dict) -> dict:
     return params
 
 
+# —— 费用成本分析模块（5 个，对接 P3 /cost/* 新端点）——
+# cost 模块维度翻译：规则引擎对「病种/诊断/疾病」产出 ccsr_diagnosis，
+# 而 cost 新接口（/cost/*）的合法维度是 diagnosis，需在此归一。
+# 注意：不要用 DIM_TO_P3_DIM（那是 disease 模块的 by 维度翻译，会把
+# payment_typology 翻成 payment，反而不被 cost 接受而 400）。
+_COST_DIM_ALIASES = {"ccsr_diagnosis": "diagnosis"}
+
+
+def _build_cost_profit_difference_params(intent: dict) -> dict:
+    _dim = _COST_DIM_ALIASES.get(intent.get("dimension"), intent.get("dimension"))
+    params = {"dimension": _dim, "top": min(intent.get("top") or 20, 100)}
+    if intent.get("year"):
+        params["year"] = intent["year"]
+    return params
+
+
+def _build_cost_profit_margin_params(intent: dict) -> dict:
+    _dim = _COST_DIM_ALIASES.get(intent.get("dimension"), intent.get("dimension"))
+    params = {"dimension": _dim, "top": min(intent.get("top") or 20, 100),
+              "order": intent.get("order") or "desc"}
+    if intent.get("year"):
+        params["year"] = intent["year"]
+    return params
+
+
+def _build_cost_efficiency_ranking_params(intent: dict) -> dict:
+    _dim = _COST_DIM_ALIASES.get(intent.get("dimension"), intent.get("dimension"))
+    params = {"dimension": _dim, "top": min(intent.get("top") or 30, 100)}
+    if intent.get("year"):
+        params["year"] = intent["year"]
+    return params
+
+
+def _build_cost_composition_params(intent: dict) -> dict:
+    _dim = _COST_DIM_ALIASES.get(intent.get("dimension"), intent.get("dimension"))
+    params = {"dimension": _dim, "top": min(intent.get("top") or 10, 50)}
+    if intent.get("year"):
+        params["year"] = intent["year"]
+    return params
+
+
+def _build_cost_trend_params(intent: dict) -> dict:
+    params = {"metric": intent.get("metric") or "total_charges"}
+    if intent.get("start_year"):
+        params["start_year"] = intent["start_year"]
+    if intent.get("end_year"):
+        params["end_year"] = intent["end_year"]
+    dim = intent.get("dimension")
+    # 趋势端点本身按 discharge_year 聚合；规则引擎把“近年趋势”解析出的
+    # discharge_year 维度是冗余的，直接视为整体趋势（否则 P3 报 400）。
+    if dim and dim != "discharge_year":
+        params["dimension"] = _COST_DIM_ALIASES.get(dim, dim)
+    if intent.get("dimension_value"):
+        params["dimension_value"] = intent["dimension_value"]
+    return params
+
+
 # 路由表：chart_hint → P3 新接口端点 + 参数构造函数 + 超时
 ROUTE_TABLE = {
     # —— 模块一：病种与手术分析（7 个）——
@@ -2028,6 +2108,14 @@ ROUTE_TABLE = {
     "cost_relation":       {"endpoint": "/payment/cost-relation",    "build": _build_cost_relation_params,       "timeout": 15},
     "oop_burden":          {"endpoint": "/payment/oop-burden",       "build": _build_oop_burden_params,          "timeout": 15},
     "payment_summary":     {"endpoint": "/payment/summary",          "build": _build_payment_summary_params,    "timeout": 15},
+    # —— 模块三：费用成本分析（5 个，对接 /cost/*）——
+    # 注意：趋势端点 chart_hint 用 cost_trend，避免与遗留 /analysis/trend 的 trend 冲突
+    # 数据量为百万级（2021+2022 全量），聚合查询较慢，timeout 提高到 60s（旧管道共用）
+    "profit_difference":   {"endpoint": "/cost/profit-difference",   "build": _build_cost_profit_difference_params,   "timeout": 60},
+    "profit_margin":       {"endpoint": "/cost/profit-margin",       "build": _build_cost_profit_margin_params,       "timeout": 60},
+    "efficiency_ranking":  {"endpoint": "/cost/efficiency-ranking",  "build": _build_cost_efficiency_ranking_params,  "timeout": 60},
+    "composition":         {"endpoint": "/cost/composition",         "build": _build_cost_composition_params,         "timeout": 60},
+    "cost_trend":          {"endpoint": "/cost/trend",               "build": _build_cost_trend_params,               "timeout": 60},
 }
 # 注：/api/v1/meta/dimensions 不在路由表（由前端启动时直接调用，不经 P4）
 
@@ -2558,6 +2646,62 @@ class _PaymentSummaryInput(BaseModel):
         description=_FILTERS_DESC + "。KPI总览无额外业务参数")
 
 
+# 费用成本分析模块（5 个，对接 P3 /cost/*）
+_COST_DIMS = Literal["age_group", "diagnosis", "drg", "facility", "mdc", "payment_typology"]
+
+
+class _CostProfitDifferenceInput(BaseModel):
+    dimension: _COST_DIMS = Field(
+        default="drg",
+        description="分组维度：age_group=年龄段, diagnosis=疾病诊断, drg=DRG分组, "
+                    "facility=医院, mdc=MDC大类, payment_typology=支付方式")
+    top: int = Field(default=20, ge=1, le=100, description="返回前N条，默认20，最大100")
+    year: int = Field(default=0, description="年份筛选(如2021)，0表示不限")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _CostProfitMarginInput(BaseModel):
+    dimension: _COST_DIMS = Field(
+        default="age_group",
+        description="分组维度：age_group=年龄段, diagnosis=疾病诊断, drg=DRG分组, "
+                    "facility=医院, mdc=MDC大类, payment_typology=支付方式")
+    top: int = Field(default=20, ge=1, le=100, description="返回前N条，默认20，最大100")
+    order: Literal["desc", "asc"] = Field(default="desc", description="排序：desc降序/asc升序")
+    year: int = Field(default=0, description="年份筛选(如2021)，0表示不限")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _CostEfficiencyRankingInput(BaseModel):
+    dimension: _COST_DIMS = Field(
+        default="mdc",
+        description="分组维度：age_group=年龄段, diagnosis=疾病诊断, drg=DRG分组, "
+                    "facility=医院, mdc=MDC大类, payment_typology=支付方式")
+    top: int = Field(default=30, ge=1, le=100, description="返回前N条，默认30，最大100")
+    year: int = Field(default=0, description="年份筛选(如2021)，0表示不限")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _CostCompositionInput(BaseModel):
+    dimension: _COST_DIMS = Field(
+        default="mdc",
+        description="分组维度：age_group=年龄段, diagnosis=疾病诊断, drg=DRG分组, "
+                    "facility=医院, mdc=MDC大类, payment_typology=支付方式")
+    top: int = Field(default=10, ge=1, le=50, description="返回前N条，默认10，最大50")
+    year: int = Field(default=0, description="年份筛选(如2021)，0表示不限")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _CostTrendInput(BaseModel):
+    metric: Literal["total_charges", "total_costs", "profit_margin"] = Field(
+        default="total_charges",
+        description="指标：total_charges=总费用, total_costs=总成本, profit_margin=利润率")
+    start_year: int = Field(default=0, description="起始年份，0表示不限")
+    end_year: int = Field(default=0, description="结束年份，0表示不限")
+    dimension: str = Field(default="", description="可选分组维度(age_group/diagnosis/drg/facility/mdc/payment_typology)，留空为整体趋势")
+    dimension_value: str = Field(default="", description="指定维度取值(配合 dimension 使用)")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
 # 遗留路由模型（向后兼容旧 /analysis/aggregate, payment-mix, trend）
 class _GeneralAggregateInput(BaseModel):
     dimension: Literal["age_group", "gender", "ccsr_diagnosis",
@@ -2661,6 +2805,49 @@ def _execute_cost_relation(by: str = "payment", top: int = 30,
     """查询费用-成本关系散点图（费用与成本的对比关系）。
     适用于"费用关系""成本对比""费用散点图""成本费用"等问法。"""
     return _dispatch_chart_hint("cost_relation", by=by, top=top, filters=filters)
+
+
+def _execute_cost_profit_difference(dimension: str = "drg", top: int = 20,
+                                    year: int = 0, filters: dict = None) -> dict:
+    """查询费用成本差(各维度下总费用减去总成本的差额排名)。
+    适用于"费用成本差""成本差""收支差额""费用减成本"等问法。"""
+    return _dispatch_chart_hint("profit_difference", dimension=dimension, top=top,
+                                year=year, filters=filters)
+
+
+def _execute_cost_profit_margin(dimension: str = "age_group", top: int = 20,
+                                order: str = "desc", year: int = 0,
+                                filters: dict = None) -> dict:
+    """查询利润率(费用相对成本的比率，按维度排名)。
+    适用于"利润率""利润""收费成本比""费用利润"等问法。"""
+    return _dispatch_chart_hint("profit_margin", dimension=dimension, top=top,
+                                order=order, year=year, filters=filters)
+
+
+def _execute_cost_efficiency_ranking(dimension: str = "mdc", top: int = 30,
+                                     year: int = 0, filters: dict = None) -> dict:
+    """查询成本效益排行(按利润率分级 A/B/C/D 并给出依据)。
+    适用于"成本效益""效益排行""效益排名""效益分级"等问法。"""
+    return _dispatch_chart_hint("efficiency_ranking", dimension=dimension, top=top,
+                                year=year, filters=filters)
+
+
+def _execute_cost_composition(dimension: str = "mdc", top: int = 10,
+                              year: int = 0, filters: dict = None) -> dict:
+    """查询费用构成(各维度占总费用的比例)。
+    适用于"费用构成""费用占比""费用组成""费用分布"等问法。"""
+    return _dispatch_chart_hint("composition", dimension=dimension, top=top,
+                                year=year, filters=filters)
+
+
+def _execute_cost_trend(metric: str = "total_charges", start_year: int = 0,
+                       end_year: int = 0, dimension: str = "",
+                       dimension_value: str = "", filters: dict = None) -> dict:
+    """查询费用年度趋势(按年份统计费用/成本/利润率，可指定维度拆分)。
+    适用于"费用趋势""年度费用""费用走势""历年费用"等问法。"""
+    return _dispatch_chart_hint("cost_trend", metric=metric, start_year=start_year,
+                                end_year=end_year, dimension=dimension,
+                                dimension_value=dimension_value, filters=filters)
 
 
 def _execute_oop_burden(dimension: str = "disease", mode: str = "selfpay1",
@@ -2771,6 +2958,36 @@ if _LANGCHAIN_AVAILABLE:
                 "适用于'费用关系''成本对比''费用散点图''成本费用'等问法。"),
             args_schema=_CostRelationInput),
         StructuredTool.from_function(
+            _execute_cost_profit_difference, name="profit_difference",
+            description=(
+                "查询费用成本差(各维度下总费用减去总成本的差额排名)。"
+                "适用于'费用成本差''成本差''收支差额''费用减成本'等问法。"),
+            args_schema=_CostProfitDifferenceInput),
+        StructuredTool.from_function(
+            _execute_cost_profit_margin, name="profit_margin",
+            description=(
+                "查询利润率(费用相对成本的比率，按维度排名，可升降序)。"
+                "适用于'利润率''利润''收费成本比''费用利润'等问法。"),
+            args_schema=_CostProfitMarginInput),
+        StructuredTool.from_function(
+            _execute_cost_efficiency_ranking, name="efficiency_ranking",
+            description=(
+                "查询成本效益排行(按利润率分级 A/B/C/D 并给出依据)。"
+                "适用于'成本效益''效益排行''效益排名''效益分级'等问法。"),
+            args_schema=_CostEfficiencyRankingInput),
+        StructuredTool.from_function(
+            _execute_cost_composition, name="composition",
+            description=(
+                "查询费用构成(各维度占总费用的比例)。"
+                "适用于'费用构成''费用占比''费用组成''费用分布'等问法。"),
+            args_schema=_CostCompositionInput),
+        StructuredTool.from_function(
+            _execute_cost_trend, name="cost_trend",
+            description=(
+                "查询费用年度趋势(按年份统计费用/成本/利润率，可指定维度拆分)。"
+                "适用于'费用趋势''年度费用''费用走势''历年费用'等问法。"),
+            args_schema=_CostTrendInput),
+        StructuredTool.from_function(
             _execute_oop_burden, name="oop_burden",
             description=(
                 "查询自付负担分析(患者自付费用负担程度)。"
@@ -2840,6 +3057,17 @@ SUGGESTED_QUESTIONS: list[dict] = [
      "question": "不同疾病的自付负担情况如何？"},
     {"tool": "payment_summary", "category": "支付与费用",
      "question": "给我一个整体的KPI总览大屏"},
+    # —— 费用成本分析（对接 /cost/*）——
+    {"tool": "profit_difference", "category": "费用成本",
+     "question": "不同支付方式的费用成本差是多少？"},
+    {"tool": "profit_margin", "category": "费用成本",
+     "question": "各年龄段的利润率是多少？"},
+    {"tool": "efficiency_ranking", "category": "费用成本",
+     "question": "哪些病种的住院成本效益最高？"},
+    {"tool": "composition", "category": "费用成本",
+     "question": "住院费用按医院是怎么构成的？"},
+    {"tool": "cost_trend", "category": "费用成本",
+     "question": "近年的住院总费用趋势如何？"},
     # —— 通用分析类 ——
     {"tool": "general_aggregate", "category": "通用分析",
      "question": "各年龄段住院人数分别是多少？"},
@@ -2935,7 +3163,7 @@ def _get_agent_executor():
 
     try:
         llm = ChatOpenAI(
-            model=LLM_MODEL_ID,
+            model=LLM_MODEL_ID_AGENT,
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
             temperature=LLM_TEMPERATURE,
@@ -2951,7 +3179,7 @@ def _get_agent_executor():
                 system_prompt=_AGENT_SYSTEM_PROMPT,
             )
             logger.info("[Agent] LangChain 1.x create_agent 就绪（model=%s, tools=%d）",
-                        LLM_MODEL_ID, len(_TOOLS))
+                        LLM_MODEL_ID_AGENT, len(_TOOLS))
         else:
             # langchain 0.2.x: create_tool_calling_agent + AgentExecutor
             prompt = ChatPromptTemplate.from_messages([
@@ -2971,7 +3199,7 @@ def _get_agent_executor():
                            in ("1", "true", "yes", "on"),
             )
             logger.info("[Agent] LangChain 0.2.x AgentExecutor 就绪（model=%s, tools=%d）",
-                        LLM_MODEL_ID, len(_TOOLS))
+                        LLM_MODEL_ID_AGENT, len(_TOOLS))
         return _AGENT_EXECUTOR
     except Exception as e:
         logger.warning("[Agent] 创建 Agent 执行器失败，将降级到旧 pipeline：%s", e)
@@ -2989,6 +3217,30 @@ def _init_valid_tool_names():
     if not _VALID_TOOL_NAMES:
         _VALID_TOOL_NAMES = set(ROUTE_TABLE.keys()) | {
             "general_aggregate", "payment_mix", "trend"}
+
+
+def _normalize_tool_name(raw: str):
+    """把工具名归一到合法名（ROUTE_TABLE 键）。
+
+    用于工具调用提取：模型选中的工具名可能因为注册时多了模块前缀
+    （如 'cost_profit_difference' vs ROUTE_TABLE 键 'profit_difference'）
+    而和 _VALID_TOOL_NAMES 对不上，导致明明命中却被当成“无效工具调用”降级。
+    这里在拒绝前先尝试去前缀归一并校验，避免误降级。
+    """
+    if not raw:
+        return None
+    _init_valid_tool_names()
+    if raw in _VALID_TOOL_NAMES:
+        return raw
+    # 去已知模块前缀后再次校验（如 cost_/payment_/disease_）。
+    stripped = raw
+    for prefix in ("cost_", "payment_", "disease_", "analysis_"):
+        if raw.startswith(prefix):
+            stripped = raw[len(prefix):]
+            break
+    if stripped in _VALID_TOOL_NAMES:
+        return stripped
+    return None
 
 
 def _parse_observation(observation) -> dict:
@@ -3014,7 +3266,10 @@ def _extract_tool_call_from_steps(steps: list) -> tuple[str, dict, dict] | None:
     """
     _init_valid_tool_names()
     for action, observation in reversed(steps):
-        tool_name = getattr(action, "tool", "")
+        raw_name = getattr(action, "tool", "")
+        tool_name = _normalize_tool_name(raw_name)
+        if not tool_name:
+            continue
         tool_input = getattr(action, "tool_input", {})
         if not isinstance(tool_input, dict):
             try:
@@ -3023,8 +3278,73 @@ def _extract_tool_call_from_steps(steps: list) -> tuple[str, dict, dict] | None:
                 tool_input = {}
 
         api_result = _parse_observation(observation)
-        if tool_name in _VALID_TOOL_NAMES and "error" not in api_result:
+        if "error" not in api_result:
             return tool_name, tool_input, api_result
+    return None
+
+
+def _extract_tool_call_from_text(text: str):
+    """从模型自由文本中兜底提取工具调用 JSON。
+
+    背景：SiliconFlow 的 Qwen 偶发不返回标准 tool_calls，而是把工具调用写进
+    回复文本（如 '{"name": "profit_difference", "args": {...}}' 或
+    'Action: profit_difference\\nAction Input: {...}'）。
+    此函数用正则从文本中提取 (tool_name, tool_args)，供提取层兜底。
+    """
+    if not text:
+        return None
+    import re as _re
+    # 模式1: {"name": "xxx", "args": {...}} 或 {"name": "xxx", "arguments": {...}}
+    # 注意匹配 arguments 用 "args?(?:uments)?"（args / argument / arguments）
+    m = _re.search(r'"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"args?(?:uments)?"\s*:\s*(\{.*?\})',
+                   text, _re.DOTALL)
+    # 模式2: Action: xxx / Action Input: {...}（ReAct 风格）
+    if not m:
+        m = _re.search(r'Action\s*:\s*([A-Za-z_][A-Za-z0-9_]*)[\s\S]{0,200}?Action\s*Input\s*:\s*(\{.*?\})',
+                       text, _re.DOTALL)
+    if m:
+        tool_name = _normalize_tool_name(m.group(1))
+        if not tool_name:
+            return None
+        try:
+            args = json.loads(m.group(2))
+            if not isinstance(args, dict):
+                args = {}
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        return tool_name, args
+    # 模式3: 带参数调用形式，如 “调用 profit_difference(dimension=...)”
+    m = _re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(', text)
+    if m:
+        tool_name = _normalize_tool_name(m.group(1))
+        if tool_name:
+            return tool_name, {}
+    # 模式4: 文本中直接出现合法工具名（SiliconFlow 乱码时模型常写
+    # “使用 profit_difference 工具查询”这类自然句），最长匹配优先
+    for name in sorted(_VALID_TOOL_NAMES, key=len, reverse=True):
+        if name in text:
+            return name, {}
+    return None
+
+
+def _invoke_tool_by_name(tool_name: str, tool_args: dict):
+    """按名称在 _TOOLS 中查找并执行工具（文本兜底用），返回 api_result 或 None。
+
+    StructuredTool.invoke 会走 Pydantic 参数校验；args 不完整时先按原参试一次，
+    失败则退化为默认参数再试，仍失败返回 None（调用方继续降级）。
+    """
+    for t in _TOOLS:
+        if getattr(t, "name", None) != tool_name:
+            continue
+        try:
+            result = t.invoke(tool_args or {})
+        except Exception:
+            try:
+                result = t.invoke({})
+            except Exception as e:
+                logger.warning("[Agent] 文本兜底工具 %s 执行失败：%s", tool_name, e)
+                return None
+        return result if isinstance(result, dict) else None
     return None
 
 
@@ -3044,17 +3364,33 @@ def _extract_tool_call_from_messages(messages: list) -> tuple[str, dict, dict] |
         if tool_calls:
             for tc in tool_calls:
                 tc_name = tc.get("name", "") if isinstance(tc, dict) else ""
-                if tc_name in _VALID_TOOL_NAMES:
-                    last_tool_name = tc_name
+                norm = _normalize_tool_name(tc_name)
+                if norm:
+                    last_tool_name = norm
                     last_tool_args = tc.get("args", {}) if isinstance(tc, dict) else {}
                     break
             if last_tool_name:
                 break
 
     if not last_tool_name:
+        # 第二步兜底：模型把工具调用写进了文本而非标准 tool_calls
+        # （SiliconFlow Qwen 常见），从 AIMessage 文本里提取并真实执行工具。
+        for msg in reversed(messages):
+            if not isinstance(msg, AIMessage):
+                continue
+            content = str(getattr(msg, "content", "") or "")
+            parsed = _extract_tool_call_from_text(content)
+            if parsed is None:
+                continue
+            tname, targs = parsed
+            api_result = _invoke_tool_by_name(tname, targs)
+            if api_result is not None and "error" not in api_result:
+                logger.info("[Agent] 文本兜底解析到工具调用 %s（args=%s）",
+                            tname, json.dumps(targs, ensure_ascii=False)[:200])
+                return tname, targs, api_result
         return None
 
-    # 第二步：从后往前找对应的 ToolMessage（工具输出）
+    # 第三步：从后往前找对应的 ToolMessage（工具输出）
     for msg in reversed(messages):
         msg_type = getattr(msg, "type", "")
         if msg_type == "tool" or isinstance(msg, ToolMessage):
@@ -3136,40 +3472,51 @@ def _handle_question_via_agent(question: str, with_report: bool | str = False,
                 content=(turn.get("answer") or "")[:300]))
 
     # 调用 agent（0.2.x 和 1.x 调用格式不同）
-    try:
-        if _LC_AGENT_API == "v1x":
-            # langchain 1.x: create_agent 返回 CompiledStateGraph，用 messages 格式
-            invoke_input = {
-                "messages": chat_history + [HumanMessage(content=question)],
-            }
-        else:
-            # langchain 0.2.x: AgentExecutor 用 input + chat_history
-            invoke_input = {
-                "input": question,
-                "chat_history": chat_history,
-            }
-        agent_result = executor.invoke(invoke_input)
-    except Exception as e:
-        logger.warning("[Agent] 执行失败，降级到旧 pipeline：%s", e)
-        _obs_inc("agent_fallback_total")
-        _obs_nested_inc("agent_fallback_reasons", "invoke_exception")
-        _log_event("agent_fallback", reason="invoke_exception", err=str(e)[:200])
-        return None
-
-    # 提取工具调用信息（0.2.x 从 intermediate_steps，1.x 从 messages）
     if _LC_AGENT_API == "v1x":
-        messages_list = agent_result.get("messages", [])
-        extracted = _extract_tool_call_from_messages(messages_list)
-        agent_text_output = ""
-        # 获取最后一条 AIMessage 的内容作为 agent 输出
-        for msg in reversed(messages_list):
-            if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
-                agent_text_output = str(msg.content or "")[:500]
-                break
+        # langchain 1.x: create_agent 返回 CompiledStateGraph，用 messages 格式
+        invoke_input = {
+            "messages": chat_history + [HumanMessage(content=question)],
+        }
     else:
-        steps = agent_result.get("intermediate_steps", [])
-        extracted = _extract_tool_call_from_steps(steps)
-        agent_text_output = agent_result.get("output", "")[:500]
+        # langchain 0.2.x: AgentExecutor 用 input + chat_history
+        invoke_input = {
+            "input": question,
+            "chat_history": chat_history,
+        }
+
+    # 重试循环：模型偶发返回空工具调用/乱码时，重新走一遍工具选择。
+    # 硬异常（连接/超时）直接降级；仅“未提取到有效工具调用”才重试。
+    extracted = None
+    agent_text_output = ""
+    for attempt in range(1 + AGENT_TOOL_RETRIES):
+        try:
+            agent_result = executor.invoke(invoke_input)
+        except Exception as e:
+            logger.warning("[Agent] 执行失败，降级到旧 pipeline：%s", e)
+            _obs_inc("agent_fallback_total")
+            _obs_nested_inc("agent_fallback_reasons", "invoke_exception")
+            _log_event("agent_fallback", reason="invoke_exception", err=str(e)[:200])
+            return None
+
+        # 提取工具调用信息（0.2.x 从 intermediate_steps，1.x 从 messages）
+        if _LC_AGENT_API == "v1x":
+            messages_list = agent_result.get("messages", [])
+            extracted = _extract_tool_call_from_messages(messages_list)
+            agent_text_output = ""
+            # 获取最后一条 AIMessage 的内容作为 agent 输出
+            for msg in reversed(messages_list):
+                if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                    agent_text_output = str(msg.content or "")[:500]
+                    break
+        else:
+            steps = agent_result.get("intermediate_steps", [])
+            extracted = _extract_tool_call_from_steps(steps)
+            agent_text_output = agent_result.get("output", "")[:500]
+
+        if extracted is not None:
+            break
+        logger.warning("[Agent] 第 %d/%d 次尝试未提取到有效工具调用，重试",
+                       attempt + 1, 1 + AGENT_TOOL_RETRIES)
 
     if extracted is None:
         logger.warning("[Agent] 未提取到有效工具调用，降级到旧 pipeline")
@@ -3179,7 +3526,7 @@ def _handle_question_via_agent(question: str, with_report: bool | str = False,
         return None
 
     tool_name, tool_args, api_result = extracted
-    _obs_inc("intent_sources", "langchain_agent")
+    _obs_nested_inc("intent_sources", "langchain_agent")
     _log_event("agent_invoked", tool=tool_name,
                args_keys=list(tool_args.keys()) if isinstance(tool_args, dict) else None)
 
@@ -3631,6 +3978,31 @@ def _summary_payment_summary(question, intent, api_result, dim_zh, metric_zh):
 
 
 # chart_hint → 模板摘要生成函数路由表（LLM 失败兜底用）
+def _summary_cost(question, intent, api_result, dim_zh, metric_zh):
+    """费用成本分析 5 个端点的通用 Top-N 摘要（profit_difference/profit_margin/
+    efficiency_ranking/composition/cost_trend 共用）。数据形状均为 {key,value/pct,count}。"""
+    chart_hint = intent.get("chart_hint")
+    title = CHART_HINT_TITLE_ZH.get(chart_hint, "费用成本分析")
+    data = api_result.get("data", [])
+    meta = api_result.get("meta", {})
+    total = meta.get("total_records", 0) or 0
+    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条住院记录。",
+             f"📊 {title}，结果如下："]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(data[:5]):
+        key = r.get("key") or r.get("year") or "-"
+        value = r.get("value")
+        if value is None:
+            value = r.get("pct") or r.get("count") or 0
+        count = r.get("count") or 0
+        v_str = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
+        extra = f"（{count:,} 例）" if count else ""
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"  {medal} 「{key}」：{v_str}{extra}")
+    lines.append(f"⏱️ 本次查询耗时 {meta.get('query_ms', 0)} ms。")
+    return "\n".join(lines)
+
+
 SUMMARY_BUILDERS = {
     "top_diagnoses":       _summary_top_diagnoses,
     "top_procedures":      _summary_top_procedures,
@@ -3645,6 +4017,12 @@ SUMMARY_BUILDERS = {
     "cost_relation":       _summary_cost_relation,
     "oop_burden":          _summary_oop_burden,
     "payment_summary":     _summary_payment_summary,
+    # —— 费用成本分析（对接 /cost/*）——
+    "profit_difference":   _summary_cost,
+    "profit_margin":       _summary_cost,
+    "efficiency_ranking":  _summary_cost,
+    "composition":         _summary_cost,
+    "cost_trend":          _summary_cost,
 }
 
 
@@ -4463,6 +4841,38 @@ def _build_payment_summary_option(intent, api_result, suggestion):
 
 
 # chart_hint → 图表构造函数路由表
+def _build_cost_option(intent, api_result, suggestion):
+    """费用成本分析 5 个端点的通用柱状图（profit_difference/profit_margin/
+    efficiency_ranking/composition/cost_trend 共用）。数据形状 {key,value/pct,count}。"""
+    data = api_result.get("data", [])
+    chart_hint = intent.get("chart_hint")
+    title = CHART_HINT_TITLE_ZH.get(chart_hint, "费用成本分析")
+    x = [str(r.get("key") or r.get("year") or "-") for r in data]
+    y = []
+    for r in data:
+        v = r.get("value")
+        if v is None:
+            v = r.get("pct") or r.get("count") or 0
+        try:
+            y.append(float(v))
+        except (TypeError, ValueError):
+            y.append(0)
+    title_obj = _base_title(suggestion, title)
+    option = {
+        "title": title_obj,
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 80, "right": 30, "bottom": 80, "top": 50},
+        "xAxis": {"type": "category", "data": x,
+                  "axisLabel": {"interval": 0, "rotate": 30}},
+        "yAxis": {"type": "value", "name": "数值"},
+        "series": [{"type": "bar", "data": y,
+                    "itemStyle": {"color": "#5470c6"},
+                    "label": {"show": True, "position": "top"}}],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
 CHART_BUILDERS = {
     "top_diagnoses":       _build_top_diagnoses_option,
     "top_procedures":      _build_top_procedures_option,
@@ -4477,6 +4887,12 @@ CHART_BUILDERS = {
     "cost_relation":       _build_cost_relation_option,
     "oop_burden":          _build_oop_burden_option,
     "payment_summary":     _build_payment_summary_option,
+    # —— 费用成本分析（对接 /cost/*）——
+    "profit_difference":   _build_cost_option,
+    "profit_margin":       _build_cost_option,
+    "efficiency_ranking":  _build_cost_option,
+    "composition":         _build_cost_option,
+    "cost_trend":          _build_cost_option,
 }
 
 
@@ -4721,6 +5137,35 @@ CHART_HINT_TITLE_ZH = {
     "cost_relation":      "费用-成本关系",
     "oop_burden":         "自付负担分析",
     "payment_summary":    "KPI 总览大屏",
+    # —— 费用成本分析（对接 /cost/*）——
+    "profit_difference":  "费用成本差",
+    "profit_margin":      "利润率",
+    "efficiency_ranking": "成本效益排行",
+    "composition":        "费用构成",
+    "cost_trend":         "费用年度趋势",
+}
+
+# chart_hint → 常见图表类型（给 /api/meta/dimensions 的能力目录做静态提示；
+# 实际渲染以响应里 chart.chart_type 为准，这里是前端"预计图形"的辅助信息）。
+_CHART_TYPE_HINT = {
+    "top_diagnoses":       ["bar"],
+    "top_procedures":      ["bar"],
+    "severity_profile":    ["bar"],
+    "population_diff":     ["bar"],
+    "pyramid":             ["pyramid"],
+    "region_diff":         ["bar"],
+    "heatmap":             ["heatmap"],
+    "payment_composition": ["pie"],
+    "payment_cross":       ["bar"],
+    "sankey":              ["sankey"],
+    "cost_relation":       ["scatter"],
+    "oop_burden":          ["bar"],
+    "payment_summary":     ["bar"],
+    "profit_difference":   ["bar"],
+    "profit_margin":       ["bar"],
+    "efficiency_ranking":  ["bar"],
+    "composition":         ["bar"],
+    "cost_trend":          ["line"],
 }
 
 
@@ -5233,6 +5678,108 @@ def health():
     })
 
 
+def _parse_chat_body() -> dict:
+    """解析 /api/chat（与 /api/chat/stream 共用）请求体，返回统一参数字典。
+
+    返回键：question / with_report / conversation_id / use_llm_intent，
+    校验失败时额外带 _error（完整错误 payload，调用方直接 jsonify 返回即可）。
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    question = (body.get("question") or "").strip()
+
+    # with_report 严格化（D2 修复）：
+    #   - 字符串：仅接受 "async"（异步生成）/ "true"（同步）/ "false"（不生成）
+    #     其他任何字符串（包括 "yes"、"1"、"0" 等）一律返回 400 错误，避免模糊真值触发同步报告
+    #   - 数字/布尔：bool(_wr) 强转（0=False，非0=True，True/False 保持）
+    #   - None / 缺省：False
+    _wr_raw = body.get("with_report", False)
+    if _wr_raw is None:
+        _wr_raw = False
+    with_report: bool | str = False
+    if isinstance(_wr_raw, str):
+        _w = _wr_raw.strip().lower()
+        if _w == "async":
+            with_report = "async"
+        elif _w in ("true", "1", "yes", "on"):
+            with_report = True
+        elif _w in ("false", "0", "no", "off", "", "none", "null"):
+            with_report = False
+        else:
+            return {"question": "", "with_report": False,
+                    "conversation_id": None, "use_llm_intent": True,
+                    "_error": {
+                        "code": 400,
+                        "message": (
+                            "with_report 参数非法：仅接受 true/false/async"
+                            "（字符串大小写不敏感），"
+                            f"实际收到 with_report={_wr_raw!r}。"
+                            "如需异步生成报告，请传 \"async\"；同步生成传 true；"
+                            "不生成传 false 或省略。"),
+                        "question": "", "answer": None, "chart": None,
+                        "report": None, "meta": {},
+                    }}
+    else:
+        with_report = bool(_wr_raw)
+
+    conversation_id = (body.get("conversation_id") or "").strip() or None
+    use_llm_intent = body.get("use_llm_intent", True)  # 默认用 LLM 意图解析
+
+    if not question:
+        return {"question": "", "with_report": with_report,
+                "conversation_id": conversation_id,
+                "use_llm_intent": use_llm_intent,
+                "_error": {
+                    "code": 400, "message": "请输入问题（question 字段不能为空）",
+                    "question": "", "answer": "⚠️ 请先输入您的问题哦~",
+                    "chart": None, "report": None, "meta": {},
+                }}
+
+    # 编码自检：如果 question 全是 ASCII 问号/数字/标点（没中文也没英文单词），
+    # 极可能是 PowerShell 5.1 把中文 ConvertTo-Json 编码成了 "???"
+    import re as _re_enc
+    has_cjk = bool(_re_enc.search(r"[\u4e00-\u9fff]", question))
+    has_english_word = bool(_re_enc.search(r"[A-Za-z]{3,}", question))
+    looks_like_lost_encoding = (
+        not has_cjk and not has_english_word
+        and "?" in question
+        and len(question.replace("?", "").strip()) < 5
+    )
+    if looks_like_lost_encoding:
+        return {"question": question, "with_report": with_report,
+                "conversation_id": conversation_id,
+                "use_llm_intent": use_llm_intent,
+                "_error": {
+                    "code": 400,
+                    "message": (
+                        "question 字段疑似编码丢失（收到全是 '?' 的字符串，"
+                        "没有中文字符）。通常是 PowerShell 5.1 的 "
+                        "ConvertTo-Json 把中文转成了 '?'。请改用 PowerShell 7+、"
+                        "curl -d UTF-8 body 或 Postman。"),
+                    "question": question,
+                    "answer": (
+                        "⚠️ 收到的问题已变成一堆 '?'，中文在传输过程中丢失了。\n"
+                        "这是 PowerShell 5.1 编码问题，不是 P4 后端 Bug。\n\n"
+                        "推荐改用以下任一测试方式：\n"
+                        "1) 升级到 PowerShell 7\n"
+                        "2) 在 PowerShell 5.1 里先跑：\n"
+                        "   [Console]::InputEncoding = [Text.Encoding]::UTF8\n"
+                        "   [Console]::OutputEncoding = [Text.Encoding]::UTF8\n"
+                        "   $OutputEncoding = [Text.Encoding]::UTF8\n"
+                        "3) 用 curl：\n"
+                        '   curl -X POST http://127.0.0.1:5001/api/chat '
+                        '-H "Content-Type: application/json" '
+                        '-d "{\\"question\\":\\"不同支付方式的费用占比如何？\\"}"'),
+                    "chart": None, "report": None, "meta": {},
+                }}
+
+    return {"question": question, "with_report": with_report,
+            "conversation_id": conversation_id,
+            "use_llm_intent": use_llm_intent}
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     """P5 前端主入口（支持多轮对话）：
@@ -5245,105 +5792,15 @@ def chat():
     返回 JSON: { question, intent, answer, chart, meta, [report],
                  conversation_id, conversation_turn }
     """
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        body = {}
-    question = (body.get("question") or "").strip()
-    # with_report 严格化（D2 修复）：
-    #   - 字符串：仅接受 "async"（异步生成）/ "true"（同步）/ "false"（不生成）
-    #     其他任何字符串（包括 "yes"、"1"、"0" 等）一律返回 400 错误，避免模糊真值触发同步报告
-    #   - 数字/布尔：bool(_wr) 强转（0=False，非0=True，True/False 保持）
-    #   - None / 缺省：False
-    _wr_raw = body.get("with_report", False)
-    if _wr_raw is None:
-        _wr_raw = False
+    body = _parse_chat_body()
+    question = body.get("question", "")
+    with_report = body.get("with_report", False)
+    conversation_id = body.get("conversation_id")
+    use_llm_intent = body.get("use_llm_intent", True)
+    error_payload = body.get("_error")
 
-    _invalid = False
-    if isinstance(_wr_raw, str):
-        _w = _wr_raw.strip().lower()
-        if _w in ("async",):
-            with_report: bool | str = "async"
-        elif _w in ("true", "1", "yes", "on"):
-            # 同步：明确的布尔真字符串 → 转 True
-            with_report = True
-        elif _w in ("false", "0", "no", "off", "", "none", "null"):
-            # 不生成：明确的布尔假字符串 → 转 False
-            with_report = False
-        else:
-            # 其他字符串一律非法："sometimes" "wait" "pending" "2" 等
-            _invalid = True
-    else:
-        with_report = bool(_wr_raw)
-
-    if _invalid:
-        return jsonify({
-            "code": 400,
-            "message": (
-                "with_report 参数非法：仅接受 true/false/async（字符串大小写不敏感），"
-                f"实际收到 with_report={_wr_raw!r}。"
-                "如需异步生成报告，请传 \"async\"；同步生成传 true；不生成传 false 或省略。"
-            ),
-            "question": "",
-            "answer": None,
-            "chart": None,
-            "report": None,
-            "meta": {},
-        }), 200
-
-    conversation_id = (body.get("conversation_id") or "").strip() or None
-    use_llm_intent = body.get("use_llm_intent", True)  # 默认用 LLM 意图解析
-
-    if not question:
-        return jsonify({
-            "code": 400,
-            "message": "请输入问题（question 字段不能为空）",
-            "question": "",
-            "answer": "⚠️ 请先输入您的问题哦~",
-            "chart": None,
-            "report": None,
-            "meta": {},
-        }), 200
-
-    # 编码自检：如果 question 全是 ASCII 问号/数字/标点（没中文也没英文单词），
-    # 极可能是 PowerShell 5.1 把中文 ConvertTo-Json 编码成了 "???"
-    # —— 用户以为是后端坏了，其实是请求体里的中文已丢失。
-    import re as _re_enc
-    has_cjk = bool(_re_enc.search(r"[\u4e00-\u9fff]", question))
-    has_english_word = bool(_re_enc.search(r"[A-Za-z]{3,}", question))
-    looks_like_lost_encoding = (
-        not has_cjk
-        and not has_english_word
-        and "?" in question
-        and len(question.replace("?", "").strip()) < 5
-    )
-    if looks_like_lost_encoding:
-        return jsonify({
-            "code": 400,
-            "message": (
-                "question 字段疑似编码丢失（收到全是 '?' 的字符串，没有中文字符）。"
-                "通常是 PowerShell 5.1 的 ConvertTo-Json 把中文转成了 '?'。"
-                "请改用以下任一方式：(1) PowerShell 7+；(2) 调用前执行 "
-                "[Console]::InputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8；"
-                "(3) 用 curl -d 直接发 UTF-8 body；(4) 用 Postman 测试。"
-            ),
-            "question": question,
-            "answer": (
-                "⚠️ 收到的问题已变成一堆 '?'，中文在传输过程中丢失了。\n"
-                "这是 PowerShell 5.1 编码问题，不是 P4 后端 Bug。\n\n"
-                "推荐改用以下任一测试方式：\n"
-                "1) 升级到 PowerShell 7\n"
-                "2) 在 PowerShell 5.1 里先跑：\n"
-                "   [Console]::InputEncoding = [Text.Encoding]::UTF8\n"
-                "   [Console]::OutputEncoding = [Text.Encoding]::UTF8\n"
-                "   $OutputEncoding = [Text.Encoding]::UTF8\n"
-                "3) 用 curl：\n"
-                '   curl -X POST http://127.0.0.1:5001/api/chat -H "Content-Type: application/json" -d "{\\"question\\":\\"不同支付方式的费用占比如何？\\"}"'
-            ),
-            "chart": None,
-            "report": None,
-            "meta": {},
-        }), 200
+    if error_payload:
+        return jsonify(error_payload), 200
 
     t0 = time.time()
     try:
@@ -5434,6 +5891,138 @@ def chat():
         }), 200
 
 
+def _sse_event(event: str, data) -> str:
+    """把事件名 + 数据格式化为 SSE 文本块（data 序列化为 JSON，ensure_ascii=False 保留中文）。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _sse_ping() -> str:
+    """SSE 心跳注释行（以冒号开头的行是注释，客户端忽略），防代理/网关断连。"""
+    return ": ping\n\n"
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
+    """SSE 流式版主入口（请求体与 /api/chat 完全一致）。
+
+    事件流（text/event-stream）：
+      event: start   → data: {"question": ..., "ts": ...}   收到请求，立即推送
+      event: result  → data: {完整 result（同 /api/chat 成功响应）}
+      event: error   → data: {code, message, answer, ...}   校验失败 / 业务异常
+      心跳：每 15s 一行 ": ping"（注释行），防连接被代理断开
+
+    前端用法（fetch + ReadableStream 逐行解析，见 P4前端接口契约.md）：
+      POST /api/chat/stream  body 同 /api/chat
+      Content-Type: text/event-stream
+    """
+    body = _parse_chat_body()
+    question = body.get("question", "")
+    with_report = body.get("with_report", False)
+    conversation_id = body.get("conversation_id")
+    use_llm_intent = body.get("use_llm_intent", True)
+    error_payload = body.get("_error")
+
+    t0 = time.time()
+
+    def generate():
+        # 0) 立即推 start（前端可立刻显示"正在分析"）
+        yield _sse_event("start", {
+            "question": question,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+
+        # 1) 校验失败：直接 error，不走 handle_question
+        if error_payload:
+            yield _sse_event("error", error_payload)
+            return
+
+        # 2) 后台线程执行 handle_question（复用报告线程池），主生成器循环发心跳
+        future = _REPORT_EXECUTOR.submit(
+            handle_question, question,
+            with_report=with_report,
+            conversation_id=conversation_id,
+            use_llm_intent=use_llm_intent,
+        )
+        last_beat = time.time()
+        while not future.done():
+            time.sleep(1)
+            if time.time() - last_beat >= 15:
+                yield _sse_ping()
+                last_beat = time.time()
+
+        try:
+            result = future.result()
+        except requests.exceptions.Timeout as e:
+            yield _sse_event("error", {
+                "code": 504,
+                "message": f"分析服务（P3）响应超时：{str(e)}，请稍后重试或简化查询条件",
+                "question": question,
+                "answer": "⏱️ 后端分析服务响应超时，可能是查询数据量过大或 P3 服务繁忙，请稍后重试。",
+                "chart": None,
+                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+            })
+            return
+        except requests.exceptions.ConnectionError as e:
+            yield _sse_event("error", {
+                "code": 502,
+                "message": f"分析服务（P3）连接失败：{str(e)}",
+                "question": question,
+                "answer": "⚠️ 后端分析服务暂时连不上，请确认 P3 是否已启动。",
+                "chart": None,
+                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+            })
+            return
+        except requests.exceptions.RequestException as e:
+            yield _sse_event("error", {
+                "code": 502,
+                "message": f"分析服务（P3）请求异常：{type(e).__name__}: {str(e)}",
+                "question": question,
+                "answer": "⚠️ 后端分析服务请求异常，请检查 P3 状态。",
+                "chart": None,
+                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+            })
+            return
+        except (KeyError, ValueError, TypeError) as e:
+            yield _sse_event("error", {
+                "code": 400,
+                "message": f"无法解析您的问题或分析结果异常：{type(e).__name__}: {str(e)}",
+                "question": question,
+                "answer": "🤔 您的问题暂时无法解析或分析结果异常，建议换一种更明确的问法。",
+                "chart": None,
+                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+            })
+            return
+        except Exception as e:
+            logger.error("handle_question(SSE) 未预期异常：%s: %s",
+                         type(e).__name__, e, exc_info=True)
+            yield _sse_event("error", {
+                "code": 500,
+                "message": f"分析失败：{type(e).__name__}: {str(e)}",
+                "question": question,
+                "answer": "⚠️ 抱歉，分析过程中出现异常，请检查日志或换个问题再试。",
+                "chart": None,
+                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+            })
+            return
+
+        # 3) 成功：补全 code/message/p4_total_ms 后推 result
+        result["code"] = 0
+        result["message"] = "success"
+        result["meta"] = dict(result.get("meta", {}))
+        result["meta"]["p4_total_ms"] = int((time.time() - t0) * 1000)
+        yield _sse_event("result", result)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # 关 nginx 缓冲，让事件即时到前端
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @app.route("/api/suggested-questions", methods=["GET"])
 def suggested_questions():
     """P5 前端『推荐问题』数据源：覆盖全部 16 个分析工具，单一来源。
@@ -5453,6 +6042,95 @@ def suggested_questions():
             {"name": name, "items": items}
             for name, items in cats.items()
         ],
+    }), 200
+
+
+def _safe_args_schema(tool) -> dict:
+    """安全提取 LangChain StructuredTool 的 args_schema（JSON Schema 兼容 dict）。
+
+    StructuredTool.args 是 Pydantic 模型生成的 JSON Schema（含 properties/required/
+    $defs 等），前端可据此自动渲染参数表单。个别工具 schema 可能含不可 JSON 序列化
+    的对象（如特殊 Field），这里 try/except 兜底返回空。
+    """
+    try:
+        schema = tool.args if hasattr(tool, "args") else {}
+        if not isinstance(schema, dict):
+            schema = {}
+        # 兼容 pydantic v1/v2 生成的 schema 顶层结构
+        if "properties" not in schema and hasattr(tool, "args_schema"):
+            try:
+                schema = tool.args_schema.model_json_schema()
+            except Exception:
+                schema = {}
+        return schema
+    except Exception:
+        return {}
+
+
+@app.route("/api/meta/dimensions", methods=["GET"])
+def meta_dimensions():
+    """P5 前端『分析能力元信息』数据源（与 P3 的 /api/v1/meta/dimensions 互补）。
+
+    P3 的 meta/dimensions 返回维度枚举值（诊断/术式/支付方式等实际取值），
+    本端点返回 P4 的「能力目录 + 参数 schema + 中英字典」：
+      - capabilities：每个 chart_hint 的 endpoint / 中文标题 / 图表类型 / 超时
+      - tools：每个 LangChain 工具的 args_schema（前端可自动渲染参数表单）
+      - dictionaries：指标/维度/严重程度的中英文映射、调色板
+      - sources：当前路由来源（langchain_agent / rules 等，供前端展示能力状态）
+
+    全部从 agent.py 现有注册表自动聚合，无重复维护；新增接口后自动出现。
+    """
+    # 1) 能力目录：ROUTE_TABLE（endpoint/build/timeout）∪ CHART_BUILDERS（图表类型）
+    capabilities = []
+    for hint, route in sorted(ROUTE_TABLE.items()):
+        chart_types = []
+        builder = CHART_BUILDERS.get(hint)
+        if builder is not None:
+            # 无法静态拿到 chart_type（要跑数据），这里给出常见类型提示由前端兜底；
+            # 实际渲染以响应里 chart.chart_type 为准。
+            chart_types = _CHART_TYPE_HINT.get(hint, [])
+        capabilities.append({
+            "chart_hint": hint,
+            "title_zh": CHART_HINT_TITLE_ZH.get(hint, hint),
+            "endpoint": route["endpoint"],
+            "timeout": route["timeout"],
+            "chart_types": chart_types or ["bar"],
+        })
+
+    # 2) 工具参数 schema（前端自动渲染表单用）
+    tools = []
+    for t in _TOOLS:
+        name = getattr(t, "name", "")
+        tools.append({
+            "tool": name,
+            "description": getattr(t, "description", ""),
+            "args_schema": _safe_args_schema(t),
+        })
+
+    # 3) 中英字典 + 调色板 + 严重程度
+    dictionaries = {
+        "metrics": METRIC_ZH,
+        "dimensions": DIMENSION_ZH,
+        "p3_dimensions": P3_DIM_ZH,
+        "severity": SEVERITY_ZH,
+        "severity_order": SEVERITY_ORDER,
+        "colors": COLORS,
+    }
+
+    return jsonify({
+        "code": 0,
+        "message": "success",
+        "data": {
+            "capabilities": capabilities,
+            "tools": tools,
+            "dictionaries": dictionaries,
+            "sources": {
+                "langchain_agent": bool(_LANGCHAIN_AVAILABLE and LLM_ENABLED),
+                "llm_enabled": bool(LLM_ENABLED),
+                "tools_count": len(_TOOLS),
+            },
+        },
+        "meta": {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
     }), 200
 
 
