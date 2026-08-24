@@ -1,7 +1,0 @@
-[
-  {"name": "profit_difference",   "q": "不同支付方式的费用成本差是多少？"},
-  {"name": "profit_margin",       "q": "各年龄段的利润率是多少？"},
-  {"name": "efficiency_ranking",  "q": "哪些病种的住院成本效益最高？"},
-  {"name": "composition",         "q": "住院费用按医院是怎么构成的？"},
-  {"name": "cost_trend",          "q": "近年的住院总费用趋势如何？"}
-]
