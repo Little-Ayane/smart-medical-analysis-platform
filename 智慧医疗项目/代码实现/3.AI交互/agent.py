@@ -11,9 +11,11 @@ P4 · AI 智能交互模块
     2. 再启动 P4：python agent.py   →  http://127.0.0.1:5001
     3. P5 前端 POST →  http://127.0.0.1:5001/api/chat
 """
+import hashlib
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -50,7 +52,9 @@ _RUNTIME_STATS = {
     "legacy_path_total": 0,       # 走旧 pipeline 的请求数（含 Agent 降级）
     "agent_fallback_total": 0,    # Agent 返回 None 降级到旧管道的次数
     "agent_fallback_reasons": {}, # 降级原因 -> 计数
-    "intent_sources": {},         # 意图来源(llm/rules/rules_fallback/langchain_agent) -> 计数
+    "intent_sources": {},         # 意图来源(llm/rules/rules_fallback/langchain_agent/out_of_scope) -> 计数
+    "out_of_scope_total": 0,      # Agent 判定非数据分析问题（未调用任何工具）的次数
+    "agent_no_tool_total": 0,     # Agent 未调用任何工具的次数（与 out_of_scope_total 同源）
     "p3_calls_total": 0,          # P3 接口调用总次数（两条路径合计）
     "p3_error_total": 0,          # P3 调用失败次数（按 kind 细分）
     "p3_errors_by_kind": {},      # 错误类型(timeout/connection_failed/invalid_response/p3_error) -> 计数
@@ -58,6 +62,7 @@ _RUNTIME_STATS = {
     "summary_calls_total": 0,     # 摘要生成总次数
     "summary_llm_calls": 0,       # 摘要中实际调用 LLM 的次数
     "summary_errors": 0,          # 摘要生成异常次数（兜底前）
+    "summary_cache_hits": 0,      # 摘要缓存命中次数（省掉的 LLM 调用数）
     "summary_latency_ms_total": 0,# 摘要生成累计耗时（ms）
     "langchain_version": None,    # Agent 创建后写入（v02/v1x）
     "start_ts": int(time.time()), # 进程启动时刻（用于 uptime）
@@ -174,7 +179,7 @@ from pydantic import BaseModel, Field
 try:
     from langchain_core.tools import StructuredTool
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
     from langchain_openai import ChatOpenAI
 
     # 优先尝试 0.2.x API
@@ -273,29 +278,30 @@ def _build_llm_messages(question: str, intent: dict, data: list, meta: dict,
         "你的任务：基于结构化的住院患者数据分析结果，输出严格 JSON，"
         "同时包含「中文摘要」和「图表标题建议」两部分，给医院管理者/医保人员/临床科室看。\n"
         "\n"
-        "⚠️ 严格写作要求（违反任意一条都算失败）：\n"
-        "1. 数据必须严格忠于输入数据，禁止编造或修改任何数字！例如输入是7.2天，输出绝不能是34天。\n"
-        "2. 禁止重复字符（如「22年年年」「比比比比」），每个字只写一遍。\n"
-        "3. 禁止使用 markdown 转义符 \\; 或反斜杠，只用普通中文标点（。，、；）。\n"
-        "4. 摘要开头直接点题，不要说「好的我来分析」这类废话。\n"
-        "5. 用专业但不晦涩的语言。\n"
-        "6. 突出核心数字：总样本量、Top1/Top2/Top3 的数值和对比（倍数/差值）。\n"
-        "7. 如果有趋势/占比，要指出「上升/下降」「集中/分散」。\n"
-        "8. 摘要结尾给出 1-2 条业务层面的观察或建议（结合数据说，不要太泛）。\n"
-        "9. 摘要最多使用 2 个 emoji（📊 📈 💡 🏥），不要滥用。\n"
-        "10. 摘要控制在 150-300 字之间，分 2-3 段，每段一句话一个意思。\n"
+        "写作原则（只有第 1 条是硬约束，其余请自由发挥）：\n"
+        "1. 【硬约束】数据必须严格忠于输入，禁止编造或修改任何数字；"
+        "禁止重复字符/乱码；禁止使用 markdown 反斜杠转义，只用普通中文标点。\n"
+        "2. 开头直接切入主题，不要「好的我来分析」之类的套话。\n"
+        "3. 语言要自然、有辨识度：像一位资深医疗数据分析师在向科室主任口头汇报，"
+        "句式应随数据内容而变化，避免千篇一律的模板腔（例如总是「结果显示…位居榜首…建议…」）；"
+        "尤其不要每次都用「数据显示」「从数据来看」「分析结果显示」这类固定开头，"
+        "尽量直接从最有信息量的事实切入。\n"
+        "4. 突出数据里真正值得说的点：关键对比、异常值、占比或趋势，不必面面俱到地罗列 Top1/2/3。\n"
+        "5. 若数据中有值得注意的业务洞察（如某病种占比异常高、费用或住院时间明显偏离），"
+        "可以点出来；不要为了凑「建议」而硬编一条。\n"
+        "6. 篇幅适中（80-250 字），自然成段；emoji 最多 2 个，克制使用。\n"
+        "7. 数据中若出现英文维度取值（如性别 F/M、支付方式 Medicare、严重程度 Minor、\n"
+        "   疾病名、出院去向等），在摘要正文中一律使用中文表达（如「女」「联邦医疗保险」\n"
+        "   「轻度」「活产儿」），不要原样保留英文缩写或代码。\n"
         "\n"
-        "⚠️ 输出格式（严格 JSON，不要加 markdown 代码块，不要任何额外文字）：\n"
+        "输出格式（严格 JSON，不要 markdown 代码块，不要任何额外文字）：\n"
         "{\n"
-        "  \"summary\": \"中文摘要正文（150-300字）\",\n"
+        "  \"summary\": \"中文摘要正文\",\n"
         "  \"chart_suggestion\": {\n"
         "    \"title\": \"图表标题（10字以内，具体而非泛化，如『Top 诊断排行』而非『分析结果』）\",\n"
-        "    \"subtitle\": \"15字内的副标题（可选，没灵感就给空字符串）\"\n"
+        "    \"subtitle\": \"15字内副标题（可选，没灵感给空字符串）\"\n"
         "  }\n"
         "}\n"
-        "\n"
-        "✅ 输出示例（参考结构，不要照抄数字）：\n"
-        "{\"summary\":\"📊 针对您的问题，共分析了50万条住院记录。\\n排名第一的是肺炎，平均住院7.2天，比第二名新冠（9.5天）少2.3天。\\n建议医院关注肺炎患者的早期干预，以缩短平均住院时间。\",\"chart_suggestion\":{\"title\":\"疾病平均住院时长Top榜\",\"subtitle\":\"单位：天\"}}\n"
         "\n"
         "注意：chart_suggestion 只需要给标题和副标题，不要给 chart_type（图表类型由系统规则决定）。\n"
         "如果数据样例不适合给标题建议（如 KPI 大屏），chart_suggestion 可以给空对象 {}。"
@@ -530,6 +536,98 @@ def _call_llm_safely(messages: list[dict], use_small_model: bool = False) -> tup
     except Exception as e:
         return False, f"LLM 未知异常：{type(e).__name__}: {str(e)[:200]}"
 
+
+# 流式 token 合并阈值：累积 >= 该字符数才回调一次（SiliconFlow 常逐字符返回）
+_STREAM_FLUSH_CHARS = int(os.getenv("STREAM_FLUSH_CHARS", "8"))
+
+
+def _call_llm_stream(messages: list[dict], on_token, use_small_model: bool = False) -> tuple[bool, str]:
+    """流式调用 LLM（SSE 真流式用）：每个增量 token 通过 on_token(piece) 回调逐段输出，
+    同时累积完整文本。返回 (True, 完整文本) / (False, 失败原因)，失败不抛异常。
+
+    与 _call_llm_safely 保持同一套容错（超时/网络/乱码检测），仅传输方式为 stream=True。
+    on_token 回调异常不影响主流程（前端断连时静默忽略）。
+    小 token 按 _STREAM_FLUSH_CHARS 阈值合并后再回调（SiliconFlow 常逐字符返回，
+    直接透传会产生上百个 SSE 事件，合并后更平滑）。
+    """
+    if not LLM_ENABLED:
+        return False, "LLM 未启用（未设置 LLM_API_KEY 环境变量）"
+    use_small = bool(use_small_model and LLM_SMALL_ENABLED)
+    model_id = LLM_MODEL_ID_SMALL if use_small else LLM_MODEL_ID
+    max_tokens = 800 if use_small else 1200
+    try:
+        url = f"{LLM_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": LLM_TEMPERATURE,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        content = ""
+        pending = []          # 待合并的小 token 缓冲
+        pending_len = 0
+
+        def _flush_pending():
+            """把缓冲的小 token 合并成一段回调（SSE 事件数收敛）。"""
+            nonlocal pending, pending_len
+            if not pending:
+                return
+            try:
+                on_token("".join(pending))
+            except Exception:
+                pass  # 回调异常（前端断连等）不影响主流程
+            pending = []
+            pending_len = 0
+
+        with requests.post(url, headers=headers, json=body,
+                           timeout=LLM_TIMEOUT, stream=True) as resp:
+            if resp.status_code != 200:
+                return False, f"LLM HTTP {resp.status_code}: {resp.text[:300]}"
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload_str = line[5:].strip()
+                if payload_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                piece = delta.get("content") or ""
+                if piece:
+                    content += piece
+                    pending.append(piece)
+                    pending_len += len(piece)
+                    if pending_len >= _STREAM_FLUSH_CHARS:
+                        _flush_pending()
+        _flush_pending()  # 流结束前 flush 剩余 token
+        content = content.strip()
+        if not content:
+            return False, "LLM 流式返回空 content"
+        # 乱码检测：与 _call_llm_safely 一致，垃圾输出降级到模板
+        if _detect_llm_garbage(content):
+            return False, (f"LLM 输出质量不合格（检测到重复字符或乱码），自动降级到模板。"
+                           f"前80字预览：{content[:80]}")
+        return True, content
+    except requests.exceptions.Timeout:
+        return False, f"LLM 调用超时（>{LLM_TIMEOUT}s）"
+    except requests.exceptions.RequestException as e:
+        return False, f"LLM 网络异常：{type(e).__name__}: {str(e)[:200]}"
+    except Exception as e:
+        return False, f"LLM 未知异常：{type(e).__name__}: {str(e)[:200]}"
+
 # 意图 -> 分析接口 的映射表（供工具调用时匹配）
 INTENT_TO_API = {
     ("*", "count"):              "/analysis/aggregate",
@@ -618,6 +716,15 @@ CHART_HINT_KEYWORDS = {
     "成本效益": "efficiency_ranking", "效益排行": "efficiency_ranking", "效益排名": "efficiency_ranking",
     "费用构成": "composition", "费用占比": "composition", "费用组成": "composition",
     "费用趋势": "cost_trend", "年度费用": "cost_trend", "费用走势": "cost_trend", "历年费用": "cost_trend",
+    # —— 医疗质量监测（模块四 /api/v1/quality/*）——
+    "医疗质量": "quality_overview", "质量总览": "quality_overview",
+    "质量概览": "quality_overview", "质量指标": "quality_overview",
+    "死亡率排行": "quality_mortality", "死亡率排名": "quality_mortality",
+    "死亡排行": "quality_mortality", "死亡率": "quality_mortality",
+    "平均住院日": "quality_los", "住院日排行": "quality_los",
+    "医院质量对比": "quality_facility", "医院质量": "quality_facility",
+    "质量对比": "quality_facility",
+    "离院去向": "quality_disposition", "出院去向": "quality_disposition",
 }
 
 # P4 metric → P3 新接口 metric 翻译表（解决命名差异：P4 用 avg_length_of_stay，P3 新接口用 avg_los）
@@ -1265,6 +1372,12 @@ parse_intent = _parse_intent_cached
 MULTITURN_HISTORY_TURNS = int(os.getenv("MULTITURN_HISTORY_TURNS",
                                          str(min(5, MAX_HISTORY_TURNS))))
 
+# Agent 工具选择注入的历史轮数：历史过长会淹没工具选择判断（实测 2 轮以上历史时
+# DeepSeek-V3 对「交叉分布热力图」类问题开始 no-tool 误判 out_of_scope）。
+# 多轮真正需要的上下文（filters 继承/追问补参）由规则引擎在意图重建层处理，
+# 工具选择只需最近几轮即可，默认 3。
+AGENT_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "3"))
+
 
 def _format_history_for_intent(history: list[dict],
                                max_turns: int = None,
@@ -1660,6 +1773,33 @@ def _infer_chart_hint_params(intent: dict, question: str = "") -> None:
     elif hint == "top_procedures":
         if not intent.get("top"):
             intent["top"] = 20
+    elif hint in ("quality_mortality", "quality_los"):
+        # dimension: diagnosis / facility / age_group / severity / risk_mortality
+        dim = intent.get("dimension")
+        if dim and dim in _QUALITY_DIM_MAP:
+            intent["dimension"] = _QUALITY_DIM_MAP[dim]
+        else:
+            # P4 未命中合法维度 → 从问句关键词二次推断（含 risk_mortality）
+            if "风险" in q:
+                intent["dimension"] = "risk_mortality"
+            elif "医院" in q or "机构" in q:
+                intent["dimension"] = "facility"
+            elif "年龄" in q:
+                intent["dimension"] = "age_group"
+            elif "严重" in q or "病情" in q:
+                intent["dimension"] = "severity"
+            else:
+                intent["dimension"] = "diagnosis"
+        if not intent.get("top"):
+            intent["top"] = 20
+    elif hint == "quality_facility":
+        # 固定 facility 维度，只补 top 默认 15（医院名长）
+        if not intent.get("top"):
+            intent["top"] = 15
+    elif hint == "quality_overview":
+        pass  # 无业务参数，只接受 filters
+    elif hint == "quality_disposition":
+        pass  # 无业务参数，只接受 filters
 
 
 def _parse_intent_by_rules(question: str, history: list[dict]) -> dict:
@@ -2091,6 +2231,56 @@ def _build_cost_trend_params(intent: dict) -> dict:
     return params
 
 
+# 医疗质量监测模块维度命名空间：P4 dimension → P3 quality dimension。
+# 注意 facility 在 quality 命名空间仍是 facility（不同于 DIM_TO_P3_DIM 的 service_area 映射）。
+_QUALITY_DIM_MAP = {
+    "ccsr_diagnosis": "diagnosis",
+    "diagnosis": "diagnosis",
+    "facility": "facility",
+    "age_group": "age_group",
+    "severity": "severity",
+    "risk_mortality": "risk_mortality",
+}
+
+
+def _norm_quality_dimension(dim):
+    """把 P4/P3 两套 dimension 统一到 quality 白名单，非法值回退 diagnosis。"""
+    if dim not in _QUALITY_DIM_MAP:
+        return "diagnosis"
+    return _QUALITY_DIM_MAP[dim]
+
+
+def _build_quality_overview_params(intent: dict) -> dict:
+    return {}  # overview 只接受 filters，无业务参数
+
+
+def _build_quality_mortality_params(intent: dict) -> dict:
+    return {
+        "dimension": _norm_quality_dimension(intent.get("dimension")),
+        "top": min(intent.get("top", 20), 100),
+        "min_cases": min(max(intent.get("min_cases", 30), 1), 10000),
+    }
+
+
+def _build_quality_los_params(intent: dict) -> dict:
+    return {
+        "dimension": _norm_quality_dimension(intent.get("dimension")),
+        "top": min(intent.get("top", 20), 100),
+        "min_cases": min(max(intent.get("min_cases", 30), 1), 10000),
+    }
+
+
+def _build_quality_facility_params(intent: dict) -> dict:
+    return {
+        "top": min(intent.get("top", 15), 100),
+        "min_cases": min(max(intent.get("min_cases", 100), 1), 10000),
+    }
+
+
+def _build_quality_disposition_params(intent: dict) -> dict:
+    return {}  # disposition 只接受 filters，无业务参数
+
+
 # 路由表：chart_hint → P3 新接口端点 + 参数构造函数 + 超时
 ROUTE_TABLE = {
     # —— 模块一：病种与手术分析（7 个）——
@@ -2116,6 +2306,12 @@ ROUTE_TABLE = {
     "efficiency_ranking":  {"endpoint": "/cost/efficiency-ranking",  "build": _build_cost_efficiency_ranking_params,  "timeout": 60},
     "composition":         {"endpoint": "/cost/composition",         "build": _build_cost_composition_params,         "timeout": 60},
     "cost_trend":          {"endpoint": "/cost/trend",               "build": _build_cost_trend_params,               "timeout": 60},
+    # —— 模块四：医疗质量监测（5 个，/api/v1/quality/*）——
+    "quality_overview":    {"endpoint": "/quality/overview",         "build": _build_quality_overview_params,    "timeout": 15},
+    "quality_mortality":   {"endpoint": "/quality/mortality",        "build": _build_quality_mortality_params,   "timeout": 15},
+    "quality_los":         {"endpoint": "/quality/length-of-stay",   "build": _build_quality_los_params,         "timeout": 15},
+    "quality_facility":    {"endpoint": "/quality/facility-ranking", "build": _build_quality_facility_params,    "timeout": 15},
+    "quality_disposition": {"endpoint": "/quality/disposition",      "build": _build_quality_disposition_params, "timeout": 15},
 }
 # 注：/api/v1/meta/dimensions 不在路由表（由前端启动时直接调用，不经 P4）
 
@@ -2202,6 +2398,11 @@ def call_analysis_api(intent: dict, question: str = "", use_llm_validate: bool =
                 "sankey": None,
                 "cost_relation": None,       # by 才是有效维度
                 "oop_burden": {"disease", "age_group", "county"},
+                "quality_overview": None,    # 全局 KPI 卡片，不接受 dimension
+                "quality_mortality": {"diagnosis", "facility", "age_group", "severity", "risk_mortality"},
+                "quality_los": {"diagnosis", "facility", "age_group", "severity", "risk_mortality"},
+                "quality_facility": {"facility"},  # 固定医院维度（避免误报"维度被忽略"）
+                "quality_disposition": None, # 全局饼图，不接受 dimension
             }
             expected = expected_dims.get(chart_hint)
             if expected is None and chart_hint in expected_dims:
@@ -2324,7 +2525,7 @@ P3_DIM_ZH = {
     "diagnosis": "疾病诊断", "procedure": "手术术式",
     "age_group": "年龄段", "gender": "性别", "severity": "严重程度",
     "payment": "支付方式", "service_area": "服务区", "county": "区县",
-    "facility": "医院",
+    "facility": "医院", "risk_mortality": "死亡风险",
     # severity_profile 的 by 取值
     "medical_surgical": "医疗/外科",
     # payment_composition 的 group 取值
@@ -2361,7 +2562,7 @@ def _make_p3_error(chart_hint, kind: str, detail: str = "") -> dict:
     下游 _finalize_result → generate_text_summary 会据此返回友好提示，
     而不是把原始异常抛到 Flask 层变成 500。
     """
-    meta = {"chart_hint": chart_hint}
+    meta = {"chart_hint": chart_hint, "error": kind}
     if detail:
         meta["error_detail"] = detail[:200]
     # 可观测：所有 P3 错误（Agent 路径 + 旧管道）统一在此累加，单一计数源
@@ -2886,6 +3087,81 @@ def _execute_trend(filters: dict = None) -> dict:
     return _dispatch_legacy("/analysis/trend", 10, filters=filters)
 
 
+# --- Section C2: 医疗质量监测工具（5 个，与 disease/payment/cost 同级的 StructuredTool）---
+# 说明：quality 的 ROUTE_TABLE 条目、_build_quality_*_params 参数构造器、P3 /quality/* 端点、
+# 摘要与图表 builder 此前已全部实现，唯独缺本段 StructuredTool 注册，导致 Agent 看不见这 5
+# 个工具、质量类问题全部被误判 out_of_scope。此处补齐，使工具集完整覆盖 4 大分析模块。
+
+class _QualityOverviewInput(BaseModel):
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _QualityMortalityInput(BaseModel):
+    dimension: Literal["diagnosis", "facility", "age_group", "severity", "risk_mortality"] = Field(
+        default="diagnosis",
+        description="死亡率排行维度：diagnosis=疾病, facility=医院, age_group=年龄段, "
+                    "severity=严重程度, risk_mortality=死亡风险分级")
+    top: int = Field(default=20, ge=1, le=100, description="返回前N条，默认20，最大100")
+    min_cases: int = Field(default=30, ge=1, le=10000, description="最小病例数阈值，默认30")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _QualityLosInput(BaseModel):
+    dimension: Literal["diagnosis", "facility", "age_group", "severity", "risk_mortality"] = Field(
+        default="diagnosis",
+        description="平均住院日排行维度：diagnosis=疾病, facility=医院, age_group=年龄段, "
+                    "severity=严重程度, risk_mortality=死亡风险分级")
+    top: int = Field(default=20, ge=1, le=100, description="返回前N条，默认20，最大100")
+    min_cases: int = Field(default=30, ge=1, le=10000, description="最小病例数阈值，默认30")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _QualityFacilityInput(BaseModel):
+    top: int = Field(default=15, ge=1, le=100, description="返回前N条，默认15，最大100")
+    min_cases: int = Field(default=100, ge=1, le=10000, description="最小病例数阈值，默认100")
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+class _QualityDispositionInput(BaseModel):
+    filters: dict = Field(default_factory=dict, description=_FILTERS_DESC)
+
+
+def _execute_quality_overview(filters: dict = None) -> dict:
+    """查询医疗质量总览（KPI 大屏：死亡率、平均住院日、再入院率等全局指标）。
+    适用于"医疗质量""质量总览""质量指标""质量概览"等问法。"""
+    return _dispatch_chart_hint("quality_overview", filters=filters)
+
+
+def _execute_quality_mortality(dimension: str = "diagnosis", top: int = 20,
+                               min_cases: int = 30, filters: dict = None) -> dict:
+    """查询住院死亡率排行（按指定维度统计死亡率，可限定最小病例数）。
+    适用于"死亡率""死亡排行""死亡率最高""住院死亡"等问法。"""
+    return _dispatch_chart_hint("quality_mortality", dimension=dimension, top=top,
+                                min_cases=min_cases, filters=filters)
+
+
+def _execute_quality_los(dimension: str = "diagnosis", top: int = 20,
+                         min_cases: int = 30, filters: dict = None) -> dict:
+    """查询平均住院日排行（按指定维度统计平均住院天数，可限定最小病例数）。
+    适用于"平均住院日""住院天数""住院最久""住院日排行"等问法。"""
+    return _dispatch_chart_hint("quality_los", dimension=dimension, top=top,
+                                min_cases=min_cases, filters=filters)
+
+
+def _execute_quality_facility(top: int = 15, min_cases: int = 100,
+                              filters: dict = None) -> dict:
+    """查询各医院质量对比排行（固定 facility 维度）。
+    适用于"医院质量""哪家医院质量好""医院质量排名""质量对比"等问法。"""
+    return _dispatch_chart_hint("quality_facility", top=top,
+                                min_cases=min_cases, filters=filters)
+
+
+def _execute_quality_disposition(filters: dict = None) -> dict:
+    """查询出院结局/离院去向构成（全局饼图）。
+    适用于"出院去向""离院去向""出院情况""出院构成"等问法。"""
+    return _dispatch_chart_hint("quality_disposition", filters=filters)
+
+
 # --- Section D: StructuredTool 列表 ---
 
 if _LANGCHAIN_AVAILABLE:
@@ -2936,8 +3212,8 @@ if _LANGCHAIN_AVAILABLE:
         StructuredTool.from_function(
             _execute_payment_composition, name="payment_composition",
             description=(
-                "查询支付方式构成(一级/二级/三级支付的分层构成)。"
-                "适用于'支付构成''三层支付''一级支付''支付层级'等问法。"),
+                "查询支付方式构成/占比(一级/二级/三级支付的分层构成)。"
+                "适用于'支付构成''支付方式占比''占比''比例''三层支付''一级支付''支付层级'等问法。"),
             args_schema=_PaymentCompositionInput),
         StructuredTool.from_function(
             _execute_payment_cross, name="payment_cross",
@@ -2985,7 +3261,8 @@ if _LANGCHAIN_AVAILABLE:
             _execute_cost_trend, name="cost_trend",
             description=(
                 "查询费用年度趋势(按年份统计费用/成本/利润率，可指定维度拆分)。"
-                "适用于'费用趋势''年度费用''费用走势''历年费用'等问法。"),
+                "适用于'费用趋势''费用变化趋势''近几年费用变化''年度费用''费用走势''历年费用'等问法。"
+                "无需用户给出具体年份，未指定时按全部年份返回。"),
             args_schema=_CostTrendInput),
         StructuredTool.from_function(
             _execute_oop_burden, name="oop_burden",
@@ -2999,32 +3276,54 @@ if _LANGCHAIN_AVAILABLE:
                 "查询KPI总览大屏(全量统计概览)。"
                 "适用于'总览''大屏''KPI''概览''全量统计''整体情况'等问法。"),
             args_schema=_PaymentSummaryInput),
-        # 遗留路由工具
+        # 遗留路由工具（仅保留真正兜底的 general_aggregate）
+        # 注：payment_mix / trend 已从 Agent 工具集移除——它们与 payment_composition / cost_trend
+        # 功能重叠且 chart_hint 恒为 None（前端无图表），曾导致"占比/趋势"类问题被路由到旧接口。
+        # 旧 pipeline（parse_intent 规则 + _dispatch_legacy）仍保留这两个能力，仅 Agent 不再暴露。
         StructuredTool.from_function(
             _execute_general_aggregate, name="general_aggregate",
             description=(
                 "通用聚合分析:按指定维度和指标统计住院数据。"
                 "当问题不匹配任何专用图表工具时使用,如'各年龄段住院人数''按性别统计费用'。"),
             args_schema=_GeneralAggregateInput),
+        # 医疗质量监测（5 个，/api/v1/quality/*）
         StructuredTool.from_function(
-            _execute_payment_mix, name="payment_mix",
+            _execute_quality_overview, name="quality_overview",
             description=(
-                "查询支付方式占比分布。"
-                "适用于'支付方式占比''医保分布''自费比例'等问法。"),
-            args_schema=_PaymentMixInput),
+                "查询医疗质量总览(KPI大屏:死亡率/平均住院日/再入院率等全局指标)。"
+                "适用于'医疗质量''质量总览''质量指标''质量概览'等问法。"),
+            args_schema=_QualityOverviewInput),
         StructuredTool.from_function(
-            _execute_trend, name="trend",
+            _execute_quality_mortality, name="quality_mortality",
             description=(
-                "查询历年住院数据趋势。"
-                "适用于'历年趋势''逐年变化''时间走势'等问法。"),
-            args_schema=_TrendInput),
+                "查询住院死亡率排行(按疾病/医院/年龄段等维度统计死亡率)。"
+                "适用于'死亡率''死亡排行''死亡率最高''住院死亡'等问法。"),
+            args_schema=_QualityMortalityInput),
+        StructuredTool.from_function(
+            _execute_quality_los, name="quality_los",
+            description=(
+                "查询平均住院日排行(按疾病/医院/年龄段等维度统计平均住院天数)。"
+                "适用于'平均住院日''住院天数''住院最久''住院日排行'等问法。"),
+            args_schema=_QualityLosInput),
+        StructuredTool.from_function(
+            _execute_quality_facility, name="quality_facility",
+            description=(
+                "查询各医院质量对比排行(固定医院维度)。"
+                "适用于'医院质量''哪家医院质量好''医院质量排名''质量对比'等问法。"),
+            args_schema=_QualityFacilityInput),
+        StructuredTool.from_function(
+            _execute_quality_disposition, name="quality_disposition",
+            description=(
+                "查询出院结局/离院去向构成(全局饼图)。"
+                "适用于'出院去向''离院去向''出院情况''出院构成'等问法。"),
+            args_schema=_QualityDispositionInput),
     ]
 else:
     _TOOLS = []
 
 
 # --- Section D2: 推荐问法注册表（单一来源） ---
-# 覆盖全部 16 个工具，前端 /api/suggested-questions 与 Agent 系统提示词 few-shot 共用。
+# 覆盖全部 21 个工具，前端 /api/suggested-questions 与 Agent 系统提示词 few-shot 共用。
 # 新增工具时只需在此追加一行，前端与 Agent 提示词会自动同步。
 SUGGESTED_QUESTIONS: list[dict] = [
     # —— 疾病诊断类 ——
@@ -3071,10 +3370,10 @@ SUGGESTED_QUESTIONS: list[dict] = [
     # —— 通用分析类 ——
     {"tool": "general_aggregate", "category": "通用分析",
      "question": "各年龄段住院人数分别是多少？"},
-    {"tool": "payment_mix", "category": "通用分析",
+    {"tool": "payment_composition", "category": "通用分析",
      "question": "各种支付方式的占比分布是怎样的？"},
-    {"tool": "trend", "category": "通用分析",
-     "question": "近几年的住院数据趋势如何变化？"},
+    {"tool": "cost_trend", "category": "通用分析",
+     "question": "近几年的住院费用趋势如何变化？"},
 ]
 
 
@@ -3104,7 +3403,7 @@ _AGENT_SYSTEM_PROMPT = """\
 5. pyramid — 人口金字塔。"人口金字塔""性别年龄分布""金字塔图"
 6. region_diff — 地区分布。"地区差异""区域分布""各县""医院分布""地理分布"
 7. heatmap — 热力图。"热力图""热图""交叉表""诊断×年龄"
-8. payment_composition — 支付构成。"支付构成""三层支付""一级支付""支付层级"
+8. payment_composition — 支付构成/占比。"支付构成""支付方式占比""占比""比例""三层支付""支付层级"
 9. payment_cross — 支付交叉。"支付×年龄""支付与病种""支付交叉""支付与严重程度"
 10. sankey — 桑基图。"桑基图""资金流向""支付链路""支付流向"
 11. cost_relation — 费用关系。"费用关系""成本对比""费用散点图""成本费用"
@@ -3112,8 +3411,11 @@ _AGENT_SYSTEM_PROMPT = """\
 13. payment_summary — KPI总览。"总览""大屏""KPI""概览""全量统计""整体情况"
 14. general_aggregate — 通用聚合。当问题不匹配以上任何专用工具时使用，\
 如"各年龄段住院人数""按性别统计费用"
-15. payment_mix — 支付方式占比。"支付方式占比""医保分布""自费比例"
-16. trend — 历年趋势。"历年趋势""逐年变化""时间走势"
+15. quality_overview — 医疗质量总览。"医疗质量""质量总览""质量指标""质量概览"
+16. quality_mortality — 死亡率排行。"死亡率""死亡排行""死亡率最高""住院死亡"
+17. quality_los — 平均住院日。"平均住院日""住院天数""住院最久""住院日排行"
+18. quality_facility — 医院质量对比。"医院质量""哪家医院质量好""医院质量排名""质量对比"
+19. quality_disposition — 离院去向。"出院去向""离院去向""出院情况""出院构成"
 
 == 筛选条件(filters)可用字段 ==
 - year: 年份(整数)，如 2021
@@ -3131,6 +3433,30 @@ _AGENT_SYSTEM_PROMPT = """\
 - 用户说"男性"→gender="M"；"女性"→gender="F"
 - 用户说"70岁以上"→age_group="70 or Older"；"儿童"→"0 to 17"
 
+== 非数据分析问题处理（重要）==
+- 本平台只回答「医院住院患者出院数据」的分析问题，且必须能映射到上述任一可用分析工具
+  （疾病、手术、费用、支付方式、医疗质量、人群/地区分布、历年趋势等）。
+- 以下类型【严禁调用任何工具】，也不要编造数据，直接礼貌回复：
+  "抱歉，本平台仅支持住院数据的统计分析，暂不支持此类医学咨询/服务问题。
+   您可以尝试询问某疾病的住院量、费用、趋势或人群分布等数据分析问题。"
+  · 疾病诊疗建议 / 用药指导（如"感冒了该怎么办""吃什么药""挂什么科"）
+  · 预后判断（如"严重吗""会死吗""需要手术吗"）
+  · 开药/诊断（如"帮我开个药""给我诊断一下"）
+  · 医学知识科普（如"XX病是什么意思""怎么预防"）
+  · 医院流程（如"怎么挂号""门诊时间""医院地址"）
+  · 医保政策（如"报销比例""医保政策""起付线"）
+- 判断标准：问题是否可被映射为某个工具的「筛选条件 + 聚合维度」查询。
+  若完全无法映射，就不要调用工具，按上面话术直接回复（此时不调用工具是正确的）。
+- 反之，只要用户问题属于「住院数据分析」且能映射到上述任一可用工具，你就【必须
+  调用对应的那一个工具】来获取真实数据，绝不能用纯文本臆测回答；每次只调用一个最贴切的工具。
+
+== 多轮对话中的工具选择（重要）==
+- 即使存在多轮对话历史，当前问题也必须【独立判断】是否属于数据分析问题，并独立选择
+  最贴切的工具——每一轮都是独立的数据分析请求。
+- 换话题时（如上一轮聊疾病排行，这一轮问费用构成/桑基图/交叉热力图/医疗质量），
+  【必须】调用对应的新工具，绝不能因为"延续上轮话题"而不调工具或用错工具。
+- 历史中的问题与回答只是背景参考，工具调用依据永远以【当前这个问题】为准。
+
 == 输出要求 ==
 1. 每次只调用一个工具
 2. 根据用户问题选择最贴切的工具，不要随意选
@@ -3140,6 +3466,33 @@ _AGENT_SYSTEM_PROMPT = """\
 6. 禁止编造或修改数据中的任何数字
 7. 摘要最多使用2个emoji（📊 📈 💡 🏥）
 8. 摘要分2-3段，每段一句话一个意思
+
+== 工具调用示范（务必以标准工具调用格式返回，不要只把工具名写在文本里）==
+- "2021年住院量最高的疾病有哪些" → 调用 top_diagnoses(filters={"year":2021}, metric="count", top=10)
+- "哪种病看得最多排名前10"       → 调用 top_diagnoses(metric="count", top=10)
+- "2021年做得最多的手术操作是什么" → 调用 top_procedures(filters={"year":2021}, metric="count", top=10)
+- "排名前5的手术有哪些"          → 调用 top_procedures(metric="count", top=5)
+- "住院患者的严重程度分布"        → 调用 severity_profile()
+- "男女住院人数差异"             → 调用 population_diff(dimension="gender")
+- "感冒了该怎么办"               → 不调用任何工具，直接按上方拒答话术回复
+- "医疗质量总体情况"             → 调用 quality_overview()
+- "死亡率最高的病种"             → 调用 quality_mortality(dimension="diagnosis", top=10)
+- "哪些病住院最久"               → 调用 quality_los(dimension="diagnosis", top=10)
+- "哪家医院质量最好"             → 调用 quality_facility(top=10)
+- "出院情况构成"                 → 调用 quality_disposition()
+- "各年龄段糖尿病住院人数"       → 调用 top_diagnoses(filters={"diagnosis":"糖尿病相关CCSR编码"}, top=20)
+- "城镇职工医保的支付占比"       → 调用 payment_composition(group="payment1")
+- "近几年住院费用变化趋势"       → 调用 cost_trend(metric="total_charges")
+- "不同支付方式的年度变化"       → 调用 payment_cross(dim2="age_group")
+- "去年和今年呼吸道疾病住院量对比" → 调用 top_diagnoses(filters={"diagnosis":"呼吸道疾病CCSR"}, top=20)
+注意：能用工具回答的问题【必须】通过工具调用返回，而不是在文本里描述"应该查XX"。
+
+== 带具体取值/模糊表述也要调工具（重要）==
+- 用户提到【具体取值】(如"糖尿病""城镇职工医保""呼吸道疾病""2021年")时，仍调用对应的
+  排行/构成工具，并通过 filters 传入该取值；绝不能因为问题带了具体值就放弃调用工具。
+- 支付方式"构成""分层""一级/二级/三级"或"占比/比例" → payment_composition（占比类问题一律用它）。
+- "近几年""历年""年度变化""趋势"无需用户给出具体年份，直接调用 cost_trend / payment_cross
+  （按全部年份返回）；"不同XX的年度变化"通常指该维度与年份的交叉，用 payment_cross / cost_relation。
 """
 
 # 注入 few-shot 示例（来自 SUGGESTED_QUESTIONS 单一来源），提升路由准确率
@@ -3215,8 +3568,7 @@ def _init_valid_tool_names():
     """初始化合法工具名集合（在 _TOOLS 创建后调用）。"""
     global _VALID_TOOL_NAMES
     if not _VALID_TOOL_NAMES:
-        _VALID_TOOL_NAMES = set(ROUTE_TABLE.keys()) | {
-            "general_aggregate", "payment_mix", "trend"}
+        _VALID_TOOL_NAMES = set(ROUTE_TABLE.keys()) | {"general_aggregate"}
 
 
 def _normalize_tool_name(raw: str):
@@ -3283,7 +3635,7 @@ def _extract_tool_call_from_steps(steps: list) -> tuple[str, dict, dict] | None:
     return None
 
 
-def _extract_tool_call_from_text(text: str):
+def _extract_tool_call_from_text(text: str, loose: bool = True):
     """从模型自由文本中兜底提取工具调用 JSON。
 
     背景：SiliconFlow 的 Qwen 偶发不返回标准 tool_calls，而是把工具调用写进
@@ -3321,8 +3673,45 @@ def _extract_tool_call_from_text(text: str):
             return tool_name, {}
     # 模式4: 文本中直接出现合法工具名（SiliconFlow 乱码时模型常写
     # “使用 profit_difference 工具查询”这类自然句），最长匹配优先
-    for name in sorted(_VALID_TOOL_NAMES, key=len, reverse=True):
-        if name in text:
+    # 仅 loose 模式启用：原生 tool-calling 场景下此模式易误触发（拒答文本出现工具名）
+    if loose:
+        for name in sorted(_VALID_TOOL_NAMES, key=len, reverse=True):
+            if name in text:
+                return name, {}
+    return None
+
+
+# 带拒答守卫的自然语言工具名识别（原生 tool-calling 路径用）。
+# 背景：SiliconFlow 的模型偶发不在 tool_calls 返回调用，而只在 content 里写
+# "可以调用 top_diagnoses 工具查询" 这类自然语言。此函数作为最后兜底，
+# 仅当文本含「调用/使用/查询/分析/用 + 合法工具名」且无明显拒答语义时命中，
+# 既抓住"模型理解了但没走标准格式"的情况，又避免拒答文本误触发工具调用。
+_REFUSAL_MARKERS = ("不支持", "暂不支持", "无法", "不能", "不提供",
+                    "不是数据分析", "不属于", "医学咨询", "诊疗建议",
+                    "无法回答", "没有对应工具", "无法为您提供")
+
+
+def _extract_tool_call_from_text_guarded(text: str):
+    """先走严格 JSON/Action/`x()` 解析；再走带守卫的自然语言兜底。
+
+    用于原生 tool-calling 路径：当模型返回 200 但 tool_calls 为空、只在
+    文本里用自然语言提到工具名时，仍能抓住意图，避免无意义的重试空转。
+    """
+    parsed = _extract_tool_call_from_text(text, loose=False)
+    if parsed:
+        return parsed
+    if not text:
+        return None
+    # 拒答语义明显时不强行解析工具名（保护 out_of_scope 判定）
+    if any(marker in text for marker in _REFUSAL_MARKERS):
+        return None
+    import re as _re
+    m = _re.search(
+        r'(?:调用|使用|查询|分析|选用|用)\s*[“"\']?'
+        r'([A-Za-z_][A-Za-z0-9_]*)\s*[”"\']?', text)
+    if m:
+        name = _normalize_tool_name(m.group(1))
+        if name:
             return name, {}
     return None
 
@@ -3417,7 +3806,7 @@ def _reconstruct_intent(tool_name: str, args: dict) -> dict:
         base["chart_hint"] = tool_name
         # 通用字段透传
         for k in ("metric", "top", "filters", "by", "dim1", "dim2",
-                  "group", "levels", "level", "mode"):
+                  "group", "levels", "level", "mode", "dimension", "min_cases"):
             if k in args:
                 base[k] = args[k]
         # population_diff 的 dimension → by（_build_population_diff_params 用 by）
@@ -3448,13 +3837,179 @@ def _reconstruct_intent(tool_name: str, args: dict) -> dict:
 
 # --- Section H: Agent 驱动的 handle_question ---
 
+# 原生 tool-calling LLM（版本无关：直接 ChatOpenAI.bind_tools + 解析 resp.tool_calls）
+# 规避 langchain 1.x create_agent 的 ReAct 提示词对 Qwen2.5-72B 的干扰。
+_TOOL_CALLING_LLM = None
+
+
+def _get_tool_calling_llm():
+    """懒加载原生 tool-calling LLM（ChatOpenAI.bind_tools(_TOOLS)）。
+
+    返回绑定了工具的 ChatOpenAI 实例；不可用时返回 None（调用方回退到
+    langchain agent 封装 / 旧 pipeline）。temperature 固定为 0，最大化工具
+    调用确定性（工具调用不应带随机性）。
+    """
+    global _TOOL_CALLING_LLM
+    if _TOOL_CALLING_LLM is not None:
+        return _TOOL_CALLING_LLM
+    if not _LANGCHAIN_AVAILABLE or not LLM_ENABLED or not _TOOLS:
+        return None
+    try:
+        llm = ChatOpenAI(
+            model=LLM_MODEL_ID_AGENT,
+            api_key=LLM_API_KEY,
+            base_url=LLM_BASE_URL,
+            temperature=float(os.getenv("LLM_TEMPERATURE_TOOL", "0")),
+            timeout=LLM_TIMEOUT,
+        )
+        _TOOL_CALLING_LLM = llm.bind_tools(_TOOLS)
+        logger.info("[Agent] 原生 tool-calling LLM 就绪（model=%s, tools=%d, temperature=0）",
+                    LLM_MODEL_ID_AGENT, len(_TOOLS))
+        return _TOOL_CALLING_LLM
+    except Exception as e:
+        logger.warning("[Agent] 创建原生 tool-calling LLM 失败，将回退到 langchain agent 封装：%s", e)
+        return None
+
+
+def _build_agent_chat_history(history) -> list:
+    """把会话历史拼成 LangChain 消息列表（Human/AIMessage 交替）。
+
+    只取最近 AGENT_HISTORY_TURNS 轮：历史过长会淹没工具选择判断
+    （实测多轮后模型开始 no-tool 误判 out_of_scope）；追问补参由规则引擎负责。
+    """
+    chat_history = []
+    if history:
+        for turn in history[-AGENT_HISTORY_TURNS:]:
+            chat_history.append(HumanMessage(content=turn.get("question", "")))
+            chat_history.append(AIMessage(content=(turn.get("answer") or "")[:300]))
+    return chat_history
+
+
+def _assemble_agent_result(tool_name, tool_args, api_result, agent_text_output,
+                           question, with_report, conversation_id, history,
+                           stream_callback=None):
+    """从(工具名, 参数, 工具结果)组装最终 result dict（executor 与原生路径共用）。"""
+    _log_event("agent_invoked", tool=tool_name,
+               args_keys=list(tool_args.keys()) if isinstance(tool_args, dict) else None)
+    # 重建 intent（供下游 generate_text_summary / generate_chart_config 使用）
+    intent = _reconstruct_intent(tool_name, tool_args)
+    intent["_source"] = "langchain_agent"
+    intent["_reasoning"] = (
+        f"LangChain agent selected tool: {tool_name}"
+        + (f" with args: {json.dumps(tool_args, ensure_ascii=False)[:200]}"
+           if tool_args else ""))
+    # 收尾（摘要/图表/组装/warnings/会话历史/报告）与旧 pipeline 共用，保证输出一致
+    return _finalize_result(
+        question, intent, api_result,
+        with_report=with_report,
+        conversation_id=conversation_id,
+        history=history,
+        extra_meta={"agent_output": agent_text_output},
+        stream_callback=stream_callback,
+    )
+
+
+def _run_native_tool_calling(question, with_report, conversation_id, llm,
+                             stream_callback=None):
+    """版本无关的原生 tool-calling 循环。
+
+    直接 llm.bind_tools 调用 → 解析 resp.tool_calls → 执行工具 → 组装。
+    仅「硬异常(invoke 失败)」返回 None（调用方降级旧 pipeline）；
+    「未提取到有效工具调用」视为非数据分析问题 → 返回 out_of_scope result。
+    """
+    history = MEMORY.get_history(conversation_id)
+    chat_history = _build_agent_chat_history(history)
+    messages = [SystemMessage(content=_AGENT_SYSTEM_PROMPT)] + chat_history + [
+        HumanMessage(content=question)]
+    agent_text_output = ""
+
+    # 重试策略：仅对「硬异常(invoke 失败)」重试（瞬时的 429/超时/网络抖动可能恢复）；
+    # 「未提取到有效工具调用」是确定性决策（temperature=0 下重复调用结果一致），
+    # 不重试，立即判定为非数据分析问题，避免白白烧钱 + 拖慢响应。
+    last_exc = None
+    for attempt in range(1 + AGENT_TOOL_RETRIES):
+        try:
+            resp = llm.invoke(messages)
+        except Exception as e:
+            last_exc = e
+            logger.warning("[Agent] 原生 tool-calling 第 %d/%d 次调用异常，重试：%s",
+                           attempt + 1, 1 + AGENT_TOOL_RETRIES, e)
+            continue  # 硬异常 → 重试
+
+        # 1) 标准 tool_calls（OpenAI 格式，SiliconFlow Qwen2.5 支持）
+        tool_calls = getattr(resp, "tool_calls", None) or []
+        picked = None
+        for tc in tool_calls:
+            raw_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+            name = _normalize_tool_name(raw_name)
+            if name:
+                args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {}) or {}
+                if not isinstance(args, dict):
+                    args = {}
+                picked = (name, args)
+                break
+        if picked:
+            name, args = picked
+            _emit_stage(stream_callback, "querying")
+            api_result = _invoke_tool_by_name(name, args)
+            agent_text_output = str(getattr(resp, "content", "") or "")[:500]
+            return _assemble_agent_result(name, args, api_result, agent_text_output,
+                                          question, with_report, conversation_id, history,
+                                          stream_callback=stream_callback)
+
+        # 2) 文本兜底（SiliconFlow 模型偶发把调用写进 content，而非标准 tool_calls）
+        text = str(getattr(resp, "content", "") or "")
+        parsed = _extract_tool_call_from_text_guarded(text)  # 带拒答守卫的自然语言兜底
+        if parsed:
+            tname, targs = parsed
+            _emit_stage(stream_callback, "querying")
+            api_result = _invoke_tool_by_name(tname, targs)
+            if api_result is not None and "error" not in api_result:
+                logger.info("[Agent] 文本兜底解析到工具调用 %s", tname)
+                return _assemble_agent_result(tname, targs, api_result, text[:500],
+                                              question, with_report, conversation_id, history,
+                                              stream_callback=stream_callback)
+
+        # 3) 未提取到任何有效工具调用 → 确定性决策：直接判 out_of_scope，不重试
+        agent_text_output = text[:500]
+        logger.info("[Agent] 未调用任何工具，判定为非数据分析问题 → 返回暂不支持此服务")
+        _obs_inc("out_of_scope_total")
+        _obs_inc("agent_no_tool_total")
+        _log_event("agent_no_tool", reason="no_tool_call")
+        return _build_out_of_scope_result(question, agent_text_output)
+
+    # 所有重试均因硬异常失败 → 降级旧 pipeline
+    logger.warning("[Agent] 原生 tool-calling 执行失败，降级到旧 pipeline：%s", last_exc)
+    _log_event("agent_fallback", reason="invoke_exception", err=str(last_exc)[:200])
+    return None
+
+
 def _handle_question_via_agent(question: str, with_report: bool | str = False,
-                               conversation_id: str | None = None) -> dict | None:
+                               conversation_id: str | None = None,
+                               stream_callback=None) -> dict | None:
     """用 LangChain Agent 替换 parse_intent + call_analysis_api 的手工分发。
 
     成功返回 result dict（格式与 handle_question 一致）；
     失败返回 None，调用方降级到旧 pipeline。
+    stream_callback：SSE 进度/token 回调（透传给 _run_native_tool_calling / 组装）。
     """
+    # 优先：原生 tool-calling 循环（版本无关，最稳）
+    # 直接 ChatOpenAI.bind_tools + 解析 resp.tool_calls，规避 langchain 1.x
+    # create_agent 的 ReAct 提示词对 Qwen2.5-72B 的干扰（该路径下模型常不在
+    # tool_calls 返回调用，导致误判 out_of_scope）。
+    llm = _get_tool_calling_llm()
+    if llm is not None:
+        result = _run_native_tool_calling(question, with_report, conversation_id, llm,
+                                          stream_callback=stream_callback)
+        if result is not None:
+            return result
+        # 仅硬异常(invoke 失败)返回 None → 旧 pipeline 降级
+        _obs_inc("agent_fallback_total")
+        _obs_nested_inc("agent_fallback_reasons", "native_invoke_exception")
+        _log_event("agent_fallback", reason="native_invoke_exception")
+        return None
+
+    # 回退：langchain agent 封装（0.2.x create_tool_calling_agent / 1.x create_agent）
     executor = _get_agent_executor()
     if executor is None:
         _obs_inc("agent_fallback_total")
@@ -3464,12 +4019,7 @@ def _handle_question_via_agent(question: str, with_report: bool | str = False,
 
     # 构造多轮对话历史（LangChain 消息格式）
     history = MEMORY.get_history(conversation_id)
-    chat_history = []
-    if history:
-        for turn in history[-MAX_HISTORY_TURNS:]:
-            chat_history.append(HumanMessage(content=turn.get("question", "")))
-            chat_history.append(AIMessage(
-                content=(turn.get("answer") or "")[:300]))
+    chat_history = _build_agent_chat_history(history)
 
     # 调用 agent（0.2.x 和 1.x 调用格式不同）
     if _LC_AGENT_API == "v1x":
@@ -3484,19 +4034,21 @@ def _handle_question_via_agent(question: str, with_report: bool | str = False,
             "chat_history": chat_history,
         }
 
-    # 重试循环：模型偶发返回空工具调用/乱码时，重新走一遍工具选择。
-    # 硬异常（连接/超时）直接降级；仅“未提取到有效工具调用”才重试。
+    # 重试策略：仅对「硬异常(invoke 失败)」重试；「未提取到有效工具调用」是确定性
+    # 决策（temperature=0 下重复调用结果一致），不重试，立即判 out_of_scope，避免烧钱。
     extracted = None
     agent_text_output = ""
+    last_exc = None
     for attempt in range(1 + AGENT_TOOL_RETRIES):
         try:
             agent_result = executor.invoke(invoke_input)
         except Exception as e:
-            logger.warning("[Agent] 执行失败，降级到旧 pipeline：%s", e)
+            last_exc = e
+            logger.warning("[Agent] 执行失败(第 %d/%d 次)，重试：%s",
+                           attempt + 1, 1 + AGENT_TOOL_RETRIES, e)
             _obs_inc("agent_fallback_total")
-            _obs_nested_inc("agent_fallback_reasons", "invoke_exception")
-            _log_event("agent_fallback", reason="invoke_exception", err=str(e)[:200])
-            return None
+            _obs_nested_inc("agent_fallback_reasons", "invoke_exception_retry")
+            continue  # 硬异常 → 重试
 
         # 提取工具调用信息（0.2.x 从 intermediate_steps，1.x 从 messages）
         if _LC_AGENT_API == "v1x":
@@ -3515,53 +4067,152 @@ def _handle_question_via_agent(question: str, with_report: bool | str = False,
 
         if extracted is not None:
             break
-        logger.warning("[Agent] 第 %d/%d 次尝试未提取到有效工具调用，重试",
-                       attempt + 1, 1 + AGENT_TOOL_RETRIES)
+        # 未提取到工具调用 → 确定性决策，直接判 out_of_scope，不重试
+        logger.info("[Agent] 未调用任何工具，判定为非数据分析问题 → 返回暂不支持此服务")
+        _obs_inc("out_of_scope_total")
+        _obs_inc("agent_no_tool_total")
+        _log_event("agent_no_tool", reason="no_tool_call")
+        return _build_out_of_scope_result(question, agent_text_output)
 
     if extracted is None:
-        logger.warning("[Agent] 未提取到有效工具调用，降级到旧 pipeline")
+        # 所有重试均因硬异常失败 → 降级旧 pipeline
+        logger.warning("[Agent] 执行失败，降级到旧 pipeline：%s", last_exc)
         _obs_inc("agent_fallback_total")
-        _obs_nested_inc("agent_fallback_reasons", "no_tool_call")
-        _log_event("agent_fallback", reason="no_tool_call")
+        _obs_nested_inc("agent_fallback_reasons", "invoke_exception")
+        _log_event("agent_fallback", reason="invoke_exception", err=str(last_exc)[:200])
         return None
 
     tool_name, tool_args, api_result = extracted
-    _obs_nested_inc("intent_sources", "langchain_agent")
-    _log_event("agent_invoked", tool=tool_name,
-               args_keys=list(tool_args.keys()) if isinstance(tool_args, dict) else None)
+    _emit_stage(stream_callback, "querying")
+    return _assemble_agent_result(tool_name, tool_args, api_result, agent_text_output,
+                                  question, with_report, conversation_id, history,
+                                  stream_callback=stream_callback)
 
-    # 重建 intent（供下游 generate_text_summary / generate_chart_config 使用）
-    intent = _reconstruct_intent(tool_name, tool_args)
-    intent["_source"] = "langchain_agent"
-    intent["_reasoning"] = (
-        f"LangChain agent selected tool: {tool_name}"
-        + (f" with args: {json.dumps(tool_args, ensure_ascii=False)[:200]}"
-           if tool_args else ""))
 
-    # 收尾（摘要/图表/组装/warnings/会话历史/报告）与旧 pipeline 共用，保证输出一致
-    result = _finalize_result(
-        question, intent, api_result,
-        with_report=with_report,
-        conversation_id=conversation_id,
-        history=history,
-        extra_meta={"agent_output": agent_text_output},
-    )
-    return result
+# ------------------------------------------------------------
+# 数据取值中文化（英文源数据 → 中文展示）
+# P3 返回的维度取值全是英文（性别 F/M/U、年龄组 "70 or Older"、严重程度 Minor、
+# 支付方式 Medicare、出院去向 Home or Self Care 等）。在 _finalize_result 入口
+# 对 api_result 递归做「值本地化」：命中映射表才替换，未命中（诊断/手术/医院名等
+# 开放集合）保留英文——由 LLM 摘要/report 翻译 + 可选 translate_dimensions.py
+# 生成的 dim_zh_cache.json 补充覆盖。
+# ------------------------------------------------------------
+_EN_ZH_MAP = {
+    # 性别
+    "F": "女", "M": "男", "U": "未知",
+    # 年龄组（pyramid / severity_profile.group / payment_cross.dim2）
+    "0 to 17": "0-17岁", "18 to 29": "18-29岁", "30 to 49": "30-49岁",
+    "50 to 69": "50-69岁", "70 or Older": "70岁及以上",
+    # 严重程度（Minor/Moderate/Major/Extreme 无歧义时默认严重程度语义）
+    "Minor": "轻度", "Moderate": "中度", "Major": "重度", "Extreme": "极重度",
+    # 支付方式（payment_typology_1/2/3）
+    "Medicare": "联邦医疗保险", "Medicaid": "医疗补助",
+    "Private Health Insurance": "商业医疗保险", "Blue Cross/Blue Shield": "蓝十字蓝盾保险",
+    "Self-Pay": "自费", "Miscellaneous/Other": "其他/杂项",
+    "Managed Care, Unspecified": "管理式医疗(未细分)",
+    "Federal/State/Local/VA": "联邦/州/地方/退伍军人医保",
+    "Department of Corrections": "惩戒机构",
+    # 种族 / 族裔
+    "White": "白人", "Black/African American": "黑人/非裔美国人",
+    "Other Race": "其他种族", "Multi-racial": "多种族",
+    "Not Span/Hispanic": "非西语裔", "Spanish/Hispanic": "西语裔",
+    "Unknown": "未知", "Multi-ethnic": "多族裔",
+    # 入院类型 / 内外科
+    "Emergency": "急诊", "Elective": "择期", "Newborn": "新生儿",
+    "Urgent": "紧急", "Trauma": "创伤", "Not Available": "未知",
+    "Medical": "内科", "Surgical": "外科", "Not Applicable": "不适用",
+    # 出院去向（patient_disposition）
+    "Home or Self Care": "回家自行照护",
+    "Home w/ Home Health Services": "回家(家庭健康服务)",
+    "Skilled Nursing Home": "专业护理机构", "Expired": "死亡",
+    "Left Against Medical Advice": "违反医嘱离院",
+    "Short-term Hospital": "短期住院医院",
+    "Inpatient Rehabilitation Facility": "住院康复机构",
+    "Hospice - Home": "临终关怀(居家)",
+    "Psychiatric Hospital or Unit of Hosp": "精神病医院/病房",
+    "Hospice - Medical Facility": "临终关怀(医疗机构)",
+    "Facility w/ Custodial/Supportive Care": "看护/支持性护理机构",
+    "Another Type Not Listed": "其他未列出类型",
+    "Court/Law Enforcement": "法院/执法部门",
+    "Medicare Cert Long Term Care Hospital": "医保认证长期护理医院",
+    "Cancer Center or Children's Hospital": "癌症中心/儿童医院",
+    "Hosp Basd Medicare Approved Swing Bed": "医保认证轮换病床",
+    "Medicaid Cert Nursing Facility": "医疗补助认证护理机构",
+    # 地区
+    "OOS": "州外",
+}
+
+# 可选扩展映射：由 translate_dimensions.py 批量翻译诊断/手术/医院名生成的
+# dim_zh_cache.json（{英文名: 中文名}），启动时合并进 _EN_ZH_MAP（见 _load_dim_zh_cache）
+_DIM_ZH_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "dim_zh_cache.json")
+
+
+def _load_dim_zh_cache():
+    """启动时加载可选的中文扩展映射（诊断/手术/医院名等开放集合）。
+    translate_dimensions.py 生成；文件不存在时静默跳过（保留英文，不影响主流程）。"""
+    try:
+        with open(_DIM_ZH_CACHE_PATH, "r", encoding="utf-8") as f:
+            ext = json.load(f)
+        if isinstance(ext, dict):
+            _EN_ZH_MAP.update({k: v for k, v in ext.items() if isinstance(k, str) and isinstance(v, str)})
+            logger.info("[localize] 已加载中文扩展映射 %d 条（%s）", len(ext), _DIM_ZH_CACHE_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("[localize] 中文扩展映射加载失败（忽略）：%s", e)
+
+
+def _localize_value(v):
+    """单个值中文化：字符串命中映射表才替换，其余原样返回。"""
+    if isinstance(v, str):
+        return _EN_ZH_MAP.get(v, v)
+    return v
+
+
+def _localize_api_result(api_result):
+    """递归把 api_result 里所有展示用字符串值本地化（命中映射表才替换）。
+    覆盖 data 行中的 key/name/group/severity/dim2_name/age_group 等任意字段，
+    一处调用让图表类目 / report 提取 / 模板摘要 / LLM 输入全部中文化。"""
+    if isinstance(api_result, dict):
+        return {k: _localize_api_result(v) for k, v in api_result.items()}
+    if isinstance(api_result, list):
+        return [_localize_api_result(x) for x in api_result]
+    return _localize_value(api_result)
+
+
+_load_dim_zh_cache()
 
 
 def _finalize_result(question: str, intent: dict, api_result: dict,
                      with_report: bool | str = False,
                      conversation_id: str | None = None,
                      history: list = None,
-                     extra_meta: dict = None) -> dict:
+                     extra_meta: dict = None,
+                     stream_callback=None) -> dict:
     """Agent 路径与旧 pipeline 共用的结果收尾：生成摘要+图表、组装结果、
     提取 warnings、写会话历史、生成报告（同步/异步）。两条路径输出格式完全一致。
 
     extra_meta：附加到 result["meta"] 的额外字段（如 agent 路径写入 agent_output 调试信息）。
+    stream_callback：SSE 真流式进度/token 回调（{"type":"stage"|"token","..."}），None 为普通请求。
     """
     history = history or []
-    summary = generate_text_summary(question, intent, api_result, history=history)
-    chart = generate_chart_config(intent, api_result)
+    # 数据取值中文化：英文源数据（F/M/U、Minor、Medicare、Home or Self Care…）在进入
+    # 摘要/图表/report 前统一翻译成中文，保证展示层全链路中文。错误体保持原样。
+    if not (isinstance(api_result, dict) and api_result.get("error")):
+        api_result = _localize_api_result(api_result)
+    _emit_stage(stream_callback, "summarizing")
+    summary = generate_text_summary(question, intent, api_result,
+                                    history=history, stream_callback=stream_callback)
+    # 容错：P3 数据层失败时不生成图表——避免空图误导前端，且省一次 LLM 图表标题调用
+    # （generate_text_summary 的错误分支不注入 _llm_chart_suggestion，generate_chart_config
+    #  会独立再调一次 _suggest_chart_by_llm，纯属浪费）。错误详情见 meta.error / error_detail。
+    has_p3_error = bool(isinstance(api_result, dict) and api_result.get("error"))
+    if has_p3_error:
+        chart = None
+    else:
+        _emit_stage(stream_callback, "charting")
+        chart = generate_chart_config(intent, api_result)
 
     result = {
         "question": question,
@@ -3590,10 +4241,13 @@ def _finalize_result(question: str, intent: dict, api_result: dict,
     async_mode = (isinstance(with_report, str)
                   and with_report.lower() == "async")
     if with_report and not async_mode:
+        # 必须把 intent 传给报告生成器：_build_section_findings 按 chart_hint 提取
+        # key/value（pyramid/heatmap/payment_cross 等结构依赖它，缺了会显示「-」/0）
         result["report"] = generate_insight_report(single_result={
-            "api_result": api_result, "chart": chart})
+            "api_result": api_result, "chart": chart, "intent": intent})
     elif async_mode:
-        report_id = _submit_async_report(api_result=api_result, chart=chart)
+        report_id = _submit_async_report(api_result=api_result, chart=chart,
+                                         intent=intent)
         result["report_pending"] = True
         result["report_id"] = report_id
         result["report"] = None
@@ -3604,16 +4258,26 @@ def _finalize_result(question: str, intent: dict, api_result: dict,
 # ------------------------------------------------------------
 # 4. 分析结果文本生成（LLM + 模板兜底，失败自动降级）
 # ------------------------------------------------------------
+def _intent_year(intent: dict) -> str | None:
+    """从 intent.filters 提取年份（用于摘要口径说明），无则 None。"""
+    f = intent.get("filters") or {}
+    y = f.get("year")
+    return str(y) if y else None
+
+
 def _summary_topn_named(question, api_result, metric_zh, record_word: str,
-                        item_label: str) -> str:
+                        item_label: str, year=None) -> str:
     """top-diagnoses / top-procedures 共用的 Top-N 排行摘要模板。
 
     record_word：记录类型（"住院" / "手术"）；item_label：条目名（"诊断" / "术式"）。
+    year：带年份过滤时传入（如 "2021"），文案写明年份口径，避免用户误以为数据缺失
+    （全表多年份合计可达百万级，而单年可能只有几千条——2026-08-23 数据口径优化）。
     """
     data = api_result.get("data", [])
     meta = api_result.get("meta", {})
     total = meta.get("total_records", 0) or 0
-    lines = [f"📋 针对您的问题「{question}」，共分析 **{total:,}** 条{record_word}记录。",
+    scope_zh = f"{year} 年" if year else ""
+    lines = [f"📋 针对您的问题「{question}」，{scope_zh}共分析 **{total:,}** 条{record_word}记录。",
              f"📊 按{record_word}{metric_zh}排名，前 {len(data)} 种{item_label}如下："]
     medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(data[:5]):
@@ -3638,12 +4302,14 @@ def _summary_topn_named(question, api_result, metric_zh, record_word: str,
 
 def _summary_top_diagnoses(question, intent, api_result, dim_zh, metric_zh):
     """4.1 top-diagnoses 摘要：用 name（人类可读名）而不是 code。"""
-    return _summary_topn_named(question, api_result, metric_zh, "住院", "诊断")
+    return _summary_topn_named(question, api_result, metric_zh, "住院", "诊断",
+                               year=_intent_year(intent))
 
 
 def _summary_top_procedures(question, intent, api_result, dim_zh, metric_zh):
     """4.2 top-procedures 摘要：结构同 top-diagnoses。"""
-    return _summary_topn_named(question, api_result, metric_zh, "手术", "术式")
+    return _summary_topn_named(question, api_result, metric_zh, "手术", "术式",
+                               year=_intent_year(intent))
 
 
 def _summary_severity_profile(question, intent, api_result, dim_zh, metric_zh):
@@ -3932,7 +4598,7 @@ def _summary_oop_burden(question, intent, api_result, dim_zh, metric_zh):
              f"📊 自付负担分析（mode={mode}，按 self_pay_count 降序）："]
     medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(data[:5]):
-        key = r.get("key") or "-"
+        key = r.get("name") or r.get("key") or "-"
         if len(key) > 30:
             key = key[:28] + "..."
         pct = r.get("self_pay_pct") or 0
@@ -3945,7 +4611,7 @@ def _summary_oop_burden(question, intent, api_result, dim_zh, metric_zh):
         lines.append(line)
     if data:
         top = data[0]
-        lines.append(f"💡 「{top.get('key','-')}」自付负担最重；建议关注该人群的医保覆盖与减免政策。")
+        lines.append(f"💡 「{top.get('name') or top.get('key','-')}」自付负担最重；建议关注该人群的医保覆盖与减免政策。")
     lines.append(f"⏱️ 查询耗时 {meta.get('query_ms', 0)} ms。")
     return "\n".join(lines)
 
@@ -4076,29 +4742,102 @@ def _fallback_template_summary(question: str, intent: dict, api_result: dict,
     return "\n".join(lines)
 
 
-def generate_text_summary(question, intent, api_result,     history=None):
+# ------------------------------------------------------------
+# 摘要缓存（单轮场景：相同问题+意图在 TTL 内直接复用，省一次 14B 摘要调用）
+#   键 = md5(question + chart_hint + intent 关键字段 + filters)
+#   仅缓存「非错误、非空结果」；多轮对话（history 非空）不缓存（历史影响内容）。
+# ------------------------------------------------------------
+_SUMMARY_CACHE: dict[str, dict] = {}
+_SUMMARY_CACHE_LOCK = threading.Lock()
+SUMMARY_CACHE_TTL = int(os.getenv("SUMMARY_CACHE_TTL", str(10 * 60)))   # 默认 10 分钟
+SUMMARY_CACHE_MAX = int(os.getenv("SUMMARY_CACHE_MAX", "500"))
+
+
+def _summary_cache_key(question: str, intent: dict) -> str:
+    """构造摘要缓存键（只依赖问题 + 意图，不含数据，TTL 兜底数据刷新）。"""
+    parts = [question, str(intent.get("chart_hint") or "")]
+    for k in ("dimension", "metric", "top", "by", "dim1", "dim2", "group",
+              "levels", "level", "mode", "min_cases"):
+        v = intent.get(k)
+        if v is not None:
+            parts.append(f"{k}={v}")
+    filters = intent.get("filters") or {}
+    if filters:
+        parts.append("filters=" + json.dumps(filters, sort_keys=True, ensure_ascii=False))
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _summary_cache_get(key: str) -> dict | None:
+    """取缓存（过期即删并返回 None）。"""
+    with _SUMMARY_CACHE_LOCK:
+        entry = _SUMMARY_CACHE.get(key)
+        if not entry:
+            return None
+        if time.time() - entry["ts"] >= SUMMARY_CACHE_TTL:
+            _SUMMARY_CACHE.pop(key, None)
+            return None
+        return entry
+
+
+def _summary_cache_put(key: str, summary: str, chart_suggestion: dict | None) -> None:
+    """写缓存；超容量时淘汰最旧条目（粗粒度 LRU）。"""
+    with _SUMMARY_CACHE_LOCK:
+        if len(_SUMMARY_CACHE) >= SUMMARY_CACHE_MAX:
+            oldest = min(_SUMMARY_CACHE, key=lambda k: _SUMMARY_CACHE[k]["ts"])
+            _SUMMARY_CACHE.pop(oldest, None)
+        _SUMMARY_CACHE[key] = {
+            "summary": summary,
+            "chart_suggestion": chart_suggestion,
+            "ts": time.time(),
+        }
+
+
+def generate_text_summary(question, intent, api_result, history=None, stream_callback=None):
     """将结构化分析结果转化为通俗易懂的医疗摘要。
 
     优先级（生产环境稳定优先）：
     1) 若配置了 LLM_API_KEY → 先尝试调用 LLM 生成高质量摘要
     2) LLM 调用任何环节失败 → 立刻降级用规则模板兜底
     history 不为空时，告诉 LLM 这是多轮对话，让回答更连贯。
+
+    stream_callback：SSE 真流式时传入，摘要 token 以 {"type":"token","data":piece} 逐段回调。
     """
     _obs_inc("summary_calls_total")
     _t0 = time.time()
+    # 缓存：仅单轮（无历史）+ 非 P3 错误场景；命中直接复用并恢复图表建议
+    cacheable = (not history) and not (isinstance(api_result, dict) and api_result.get("error"))
+    key = _summary_cache_key(question, intent) if cacheable else None
+    if key:
+        hit = _summary_cache_get(key)
+        if hit is not None:
+            _obs_inc("summary_cache_hits")
+            if hit.get("chart_suggestion"):
+                intent["_llm_chart_suggestion"] = hit["chart_suggestion"]
+            _obs_latency("summary_latency_ms_total", (time.time() - _t0) * 1000)
+            return hit["summary"]
     try:
-        return _generate_text_summary_impl(question, intent, api_result, history)
+        text = _generate_text_summary_impl(question, intent, api_result,
+                                           history, stream_callback)
     except Exception as e:
         _obs_inc("summary_errors")
         logger.error("SUMMARY BUILDER ERROR %s: %s，降级到通用模板",
                      intent.get("chart_hint"), e, exc_info=True)
-        return "❌ 摘要生成失败，请稍后重试。"
+        text = "❌ 摘要生成失败，请稍后重试。"
     finally:
         _obs_latency("summary_latency_ms_total", (time.time() - _t0) * 1000)
+    # 写缓存：仅缓存非错误、非空结果（错误/空数据结果没有复用价值）
+    if key and text and not text.startswith("❌"):
+        _summary_cache_put(key, text, intent.get("_llm_chart_suggestion"))
+    return text
 
 
-def _generate_text_summary_impl(question, intent, api_result, history=None):
-    """generate_text_summary 的实现体（异常已被外层捕获并计错误，这里专注业务逻辑）。"""
+def _generate_text_summary_impl(question, intent, api_result, history=None,
+                                stream_callback=None):
+    """generate_text_summary 的实现体（异常已被外层捕获并计错误，这里专注业务逻辑）。
+
+    stream_callback：可选回调，摘要 LLM 走流式调用时每个增量 token 以
+    {"type":"token","data":piece} 回调（SSE 真流式用）；None 时走一次性调用。
+    """
     logger.debug("LLM_ENABLED = %s", LLM_ENABLED)
     chart_hint = intent.get("chart_hint")
 
@@ -4106,10 +4845,10 @@ def _generate_text_summary_impl(question, intent, api_result, history=None):
     if isinstance(api_result, dict) and api_result.get("error"):
         err = api_result["error"]
         if err == "timeout":
-            return "❌ 分析服务响应超时，请稍后重试。"
+            return "❌ 数据服务响应超时，请稍后重试。"
         if err == "connection_failed":
-            return "❌ 无法连接分析服务，请确认服务已启动后重试。"
-        return "❌ 分析服务返回异常，请稍后重试或联系管理员。"
+            return "❌ 无法连接数据服务，请确认服务已启动后重试。"
+        return "❌ 数据服务暂时不可用，请稍后重试或联系管理员。"
 
     meta = api_result.get("meta", {}) if api_result else {}
     metric_zh = METRIC_ZH.get(meta.get("metric", ""), meta.get("metric", "指标"))
@@ -4128,7 +4867,11 @@ def _generate_text_summary_impl(question, intent, api_result, history=None):
             if history:
                 messages[1]["content"] += _build_multiturn_context(history)
             _obs_inc("summary_llm_calls")
-            ok, text_or_reason = _call_llm_safely(messages)
+            if stream_callback:
+                ok, text_or_reason = _call_llm_stream(
+                    messages, lambda p: stream_callback({"type": "token", "data": p}))
+            else:
+                ok, text_or_reason = _call_llm_safely(messages)
             if ok:
                 # KPI 路径目前是纯文本输出，直接返回
                 return text_or_reason
@@ -4147,12 +4890,20 @@ def _generate_text_summary_impl(question, intent, api_result, history=None):
         return "❌ 未查询到符合条件的分析结果，请调整查询条件后重试。"
 
     # —— 路径1：LLM 生成（如果启用了）——
-        if LLM_ENABLED:
-            messages = _build_llm_messages(question, intent, data, meta, dim_zh, metric_zh, total)
-            # 多轮上下文：传上一轮问题 + 答案摘要（前 200 字），不只传问题
-            if history:
-                messages[1]["content"] += _build_multiturn_context(history)
-            _obs_inc("summary_llm_calls")
+    # 注意：此块必须与函数体同级缩进（曾有 8 格缩进被误嵌进 `if not data:` 成为死代码，
+    # 导致主路径摘要从未真正调用 LLM、一直走模板兜底——2026-08-23 修复）。
+    if LLM_ENABLED:
+        messages = _build_llm_messages(question, intent, data, meta, dim_zh, metric_zh, total)
+        # 多轮上下文：传上一轮问题 + 答案摘要（前 200 字），不只传问题
+        if history:
+            messages[1]["content"] += _build_multiturn_context(history)
+        _obs_inc("summary_llm_calls")
+        if stream_callback:
+            # 流式：LLM 输出是 {summary, chart_suggestion} JSON，只把 summary 值转发前端
+            _tok_cb = _SummaryStreamFilter(
+                lambda p: stream_callback({"type": "token", "data": p}))
+            ok, text_or_reason = _call_llm_stream(messages, _tok_cb)
+        else:
             ok, text_or_reason = _call_llm_safely(messages)
         if ok:
             # 优化 2：LLM 现在输出严格 JSON {summary, chart_suggestion}
@@ -4196,6 +4947,85 @@ def _parse_summary_json(raw_text: str) -> tuple[str, dict]:
         "subtitle": str(chart_sugg.get("subtitle", ""))[:30],
     }
     return summary_text, chart_sugg
+
+
+# ------------------------------------------------------------
+# 流式摘要过滤器：把 LLM 流式输出的 JSON {summary, chart_suggestion} 中
+# 的 summary 字段值逐段转发给前端（丢弃 JSON 结构），实现"打字机"式干净输出。
+# ------------------------------------------------------------
+import re as _re_summary
+_SUMMARY_VALUE_RE = _re_summary.compile(r'"summary"\s*:\s*"')
+
+
+def _unescape_summary_fragment(s: str) -> str:
+    """轻量反转义 JSON 字符串片段（\n \t \" \\）。顺序：先 \\\\ 再其余，避免 \\n 误转。"""
+    return (s.replace("\\\\", "\u0000")
+             .replace('\\"', '"')
+             .replace("\\n", "\n")
+             .replace("\\t", "\t")
+             .replace("\\r", "\r")
+             .replace("\u0000", "\\"))
+
+
+class _SummaryStreamFilter:
+    """增量解析 LLM 流式 JSON，仅把 "summary" 字段的值（反转义后）转给 on_text。
+
+    状态机：
+      - 未进入值：累积字符定位 "summary": " 开引号（模式可跨 chunk）
+      - 值内：逐段转发，直到未转义闭合引号（"\" 前缀的引号不算）
+      - 结束：忽略后续（chart_suggestion 等）
+    末尾以奇数个反斜杠结尾时，可能是跨 chunk 的转义前缀（如反斜杠与 n 被切开），
+    把最后一个反斜杠留给下一段再处理，保证反转义正确。
+    """
+
+    def __init__(self, on_text):
+        self._on_text = on_text
+        self._buf = ""
+        self._in_value = False
+        self._done = False
+
+    def __call__(self, piece: str) -> None:
+        if self._done:
+            return
+        self._buf += piece
+        if not self._in_value:
+            idx = _SUMMARY_VALUE_RE.search(self._buf)
+            if idx is None:
+                # 只保留末尾可能跨边界的部分，防无界增长
+                if len(self._buf) > 128:
+                    self._buf = self._buf[-128:]
+                return
+            self._in_value = True
+            self._buf = self._buf[idx.end():]
+
+        # 找未转义闭合引号（前一个字符不是反斜杠）
+        cut = -1
+        i = 0
+        n = len(self._buf)
+        while i < n:
+            if self._buf[i] == '"' and (i == 0 or self._buf[i - 1] != "\\"):
+                cut = i
+                break
+            i += 1
+        if cut >= 0:
+            val = self._buf[:cut]
+            self._done = True
+            self._buf = ""
+        else:
+            val = self._buf
+            self._buf = ""
+
+        # 跨段转义处理：末尾奇数个反斜杠 → 保留最后一个给下一段
+        trail = 0
+        j = len(val) - 1
+        while j >= 0 and val[j] == "\\":
+            trail += 1
+            j -= 1
+        if trail % 2 == 1 and val:
+            self._buf = val[-1] + self._buf
+            val = val[:-1]
+        if val:
+            self._on_text(_unescape_summary_fragment(val))
 
 
 # ------------------------------------------------------------
@@ -4275,8 +5105,9 @@ def _suggest_chart_by_llm(intent: dict, dim_zh: str, metric_zh: str,
 # 5.x P3 新版接口专用图表构造器（13 个）—— 命中 chart_hint 时调用
 # 每个函数签名：(intent, api_result, suggestion) -> {chart_type, option, _suggestion_source}
 # ------------------------------------------------------------
-def _base_title(suggestion: dict, default_text: str) -> dict:
-    """构造 ECharts title 对象，优先用 LLM 建议的标题。"""
+def _base_title(suggestion: dict | None, default_text: str) -> dict:
+    """构造 ECharts title 对象，优先用 LLM 建议的标题（suggestion 可为 None）。"""
+    suggestion = suggestion or {}
     title_obj = {"text": suggestion.get("title") or default_text,
                  "left": "center", "textStyle": {"fontSize": 15}}
     sub = suggestion.get("subtitle")
@@ -4746,7 +5577,8 @@ def _build_oop_burden_option(intent, api_result, suggestion):
     mode = intent.get("mode", "selfpay1")
     # 截断长名
     name_limit = 25 if dimension == "disease" else 40
-    cats = [(str(r.get("key") or "-"))[:name_limit] for r in data]
+    # 类目优先用人类可读 name（P3 返回 {key, name, self_pay_*...}），无 name 才回退 key
+    cats = [(str(r.get("name") or r.get("key") or "-"))[:name_limit] for r in data]
     pcts = [float(r.get("self_pay_pct") or 0) for r in data]
     title_obj = _base_title(suggestion, f"按{dim_zh}看自付负担（{mode} 模式）")
     option = {
@@ -4774,7 +5606,7 @@ def _build_oop_burden_option(intent, api_result, suggestion):
             "self_pay_count": r.get("self_pay_count"),
             "self_pay_avg_charges": r.get("self_pay_avg_charges"),
             "self_pay_share_of_charges": r.get("self_pay_share_of_charges"),
-            "name": (str(r.get("key") or "-"))[:name_limit],
+            "name": (str(r.get("name") or r.get("key") or "-"))[:name_limit],
         })
     option["series"][0]["data"] = enriched
     return {"chart_type": "bar", "option": option,
@@ -4873,6 +5705,161 @@ def _build_cost_option(intent, api_result, suggestion):
             "_suggestion_source": "llm" if suggestion else "rules"}
 
 
+def _build_quality_overview_option(intent, api_result, suggestion):
+    """4.1 quality-overview 质量 KPI 大屏：数字卡片 + 各质量比率柱状图。"""
+    raw = api_result.get("data") or {}
+    if isinstance(raw, list):  # 容错
+        raw = {}
+    kpi_data = {
+        "total_records": raw.get("total_records", 0),
+        "deaths": raw.get("deaths", 0),
+        "mortality_rate": raw.get("mortality_rate", 0),
+        "avg_los": raw.get("avg_los", 0),
+        "ed_rate": raw.get("ed_rate", 0),
+        "ama_rate": raw.get("ama_rate", 0),
+        "transfer_rate": raw.get("transfer_rate", 0),
+        "newborns": raw.get("newborns", 0),
+        "lbw_rate": raw.get("lbw_rate"),
+        "avg_charges": raw.get("avg_charges", 0),
+        "avg_costs": raw.get("avg_costs", 0),
+    }
+    title_obj = _base_title(suggestion, "医疗质量 KPI 总览")
+    sub_lines = [
+        f"总出院 {kpi_data['total_records']:,} 条 · 死亡 {kpi_data['deaths']:,} 人",
+        f"死亡率 {kpi_data['mortality_rate']}% · 平均住院 {kpi_data['avg_los']} 天",
+        f"急诊率 {kpi_data['ed_rate']}% · 转院率 {kpi_data['transfer_rate']}%",
+        f"次均费用 {kpi_data['avg_charges']:,.2f} 元 / 成本 {kpi_data['avg_costs']:,.2f} 元",
+    ]
+    title_obj["subtext"] = "\n".join(sub_lines)
+    title_obj["subtextStyle"] = {"fontSize": 11, "lineHeight": 16}
+    # 主图：各质量比率柱状图（大屏直观可视化）
+    rate_items = [
+        ("死亡率", kpi_data["mortality_rate"] or 0),
+        ("急诊率", kpi_data["ed_rate"] or 0),
+        ("AMA率", kpi_data["ama_rate"] or 0),
+        ("转院率", kpi_data["transfer_rate"] or 0),
+    ]
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 50, "top": 120},
+        "xAxis": {"type": "category", "data": [k for k, _ in rate_items]},
+        "yAxis": {"type": "value", "name": "比率（%）"},
+        "series": [{
+            "type": "bar", "name": "比率", "barMaxWidth": 60,
+            "data": [v for _, v in rate_items],
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "kpi", "option": option, "kpi": kpi_data,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_mortality_option(intent, api_result, suggestion):
+    """4.2 quality-mortality 死亡率排行柱状图：X=name，Y=mortality_rate（%）。"""
+    data = api_result.get("data", [])
+    cats = [r.get("name") or r.get("key") or "-" for r in data]
+    vals = [r.get("mortality_rate") or 0 for r in data]
+    title_obj = _base_title(suggestion, "死亡率排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>死亡率: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "维度"},
+        "yAxis": {"type": "value", "name": "死亡率（%）"},
+        "series": [{
+            "type": "bar", "name": "死亡率", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#ff4d4f"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_los_option(intent, api_result, suggestion):
+    """4.3 quality-length-of-stay 平均住院日排行柱状图：X=name，Y=avg_los。"""
+    data = api_result.get("data", [])
+    cats = [r.get("name") or r.get("key") or "-" for r in data]
+    vals = [r.get("avg_los") or 0 for r in data]
+    title_obj = _base_title(suggestion, "平均住院日排行 Top N")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>平均住院日: {c} 天"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 35, "interval": 0, "fontSize": 11},
+                  "name": "维度"},
+        "yAxis": {"type": "value", "name": "平均住院日（天）"},
+        "series": [{
+            "type": "bar", "name": "平均住院日", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#1e6fd9"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}天"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_facility_option(intent, api_result, suggestion):
+    """4.4 quality-facility-ranking 医院死亡率对比柱状图（按死亡率降序）。"""
+    data = api_result.get("data", [])
+    # API 原返回按出院量降序，这里按死亡率降序重排，突出"质量对比"视角
+    rows = sorted(data, key=lambda r: r.get("mortality_rate") or 0, reverse=True)
+    cats = [r.get("name") or r.get("key") or "-" for r in rows]
+    vals = [r.get("mortality_rate") or 0 for r in rows]
+    title_obj = _base_title(suggestion, "医院死亡率对比")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"},
+                    "formatter": "{b}<br/>死亡率: {c}%"},
+        "grid": {"left": 70, "right": 30, "bottom": 110, "top": 50},
+        "xAxis": {"type": "category", "data": cats,
+                  "axisLabel": {"rotate": 40, "interval": 0, "fontSize": 10},
+                  "name": "医院"},
+        "yAxis": {"type": "value", "name": "死亡率（%）"},
+        "series": [{
+            "type": "bar", "name": "死亡率", "data": vals, "barMaxWidth": 50,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0], "color": "#ff4d4f"},
+            "label": {"show": True, "position": "top", "fontSize": 10, "formatter": "{c}%"},
+        }],
+    }
+    return {"chart_type": "bar", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
+def _build_quality_disposition_option(intent, api_result, suggestion):
+    """4.5 quality-disposition 离院去向构成饼图。"""
+    data = api_result.get("data", [])
+    pie_data = [{"name": r.get("key") or "-", "value": r.get("count") or 0}
+                for r in data]
+    title_obj = _base_title(suggestion, "离院去向构成")
+    option = {
+        "color": COLORS,
+        "title": title_obj,
+        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+        "legend": {"orient": "vertical", "left": "left", "top": "middle"},
+        "series": [{
+            "type": "pie", "radius": ["35%", "65%"], "center": ["65%", "55%"],
+            "label": {"formatter": "{b}\n{d}%"},
+            "data": pie_data,
+            "itemStyle": {"borderRadius": 6, "borderColor": "#fff", "borderWidth": 2},
+        }],
+    }
+    return {"chart_type": "pie", "option": option,
+            "_suggestion_source": "llm" if suggestion else "rules"}
+
+
 CHART_BUILDERS = {
     "top_diagnoses":       _build_top_diagnoses_option,
     "top_procedures":      _build_top_procedures_option,
@@ -4893,6 +5880,11 @@ CHART_BUILDERS = {
     "efficiency_ranking":  _build_cost_option,
     "composition":         _build_cost_option,
     "cost_trend":          _build_cost_option,
+    "quality_overview":    _build_quality_overview_option,
+    "quality_mortality":   _build_quality_mortality_option,
+    "quality_los":         _build_quality_los_option,
+    "quality_facility":    _build_quality_facility_option,
+    "quality_disposition": _build_quality_disposition_option,
 }
 
 
@@ -5054,6 +6046,9 @@ _REPORT_SYSTEM_PROMPT = """你是智慧医疗大数据平台的「资深报告�
 4. 每个 recommendation 必须具体可执行，结合本报告的数据，不能用通用模板。
 5. 控制长度：summary 50-100字；每个 key_findings 1句话；recommendations 3-4条。
 6. 输出必须是严格合法的 JSON，不要加 markdown 代码块，不要任何解释文字。
+7. 数据中若出现英文维度取值（性别 F/M、支付方式 Medicare、严重程度 Minor、疾病名、
+   出院去向等），在报告中一律用中文表达（如「女」「联邦医疗保险」「轻度」「活产儿」），
+   不要原样保留英文缩写或代码。
 
 输出格式：
 {
@@ -5143,6 +6138,11 @@ CHART_HINT_TITLE_ZH = {
     "efficiency_ranking": "成本效益排行",
     "composition":        "费用构成",
     "cost_trend":         "费用年度趋势",
+    "quality_overview":   "医疗质量总览",
+    "quality_mortality":  "死亡率排行",
+    "quality_los":        "平均住院日排行",
+    "quality_facility":   "医院质量对比",
+    "quality_disposition": "离院去向构成",
 }
 
 # chart_hint → 常见图表类型（给 /api/meta/dimensions 的能力目录做静态提示；
@@ -5209,8 +6209,20 @@ def _extract_topn_keyvalue(item: dict, chart_hint: str | None = None) -> tuple[s
         key = item.get("key") or "-"
         value = item.get("charge_cost_ratio") or 0
     elif chart_hint == "oop_burden":
-        key = item.get("key") or "-"
+        key = item.get("name") or item.get("key") or "-"
         value = item.get("self_pay_count") or 0
+    elif chart_hint == "quality_mortality":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("mortality_rate") or 0
+    elif chart_hint == "quality_los":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("avg_los") or 0
+    elif chart_hint == "quality_facility":
+        key = item.get("name") or item.get("key") or "-"
+        value = item.get("count") or 0
+    elif chart_hint == "quality_disposition":
+        key = item.get("key") or "-"
+        value = item.get("count") or 0
     else:
         # 通用：top_diagnoses/top_procedures/population_diff/region_diff/payment_composition/旧路由
         key = (item.get("name") or item.get("key") or item.get("payment")
@@ -5261,6 +6273,19 @@ def _build_section_findings(chart_hint: str | None, data, meta: dict) -> list[st
         tp = data.get("top_payment") or {}
         tp_str = f" · 主要支付「{tp.get('key', '-')}」({tp.get('pct', 0)}%)" if tp else ""
         findings.append(f"自付 {sp_count:,} 人（{sp_pct}%）{tp_str}")
+        return findings
+
+    # —— 特殊 3：quality_overview 的 data 是 dict（质量 KPI 大屏）——
+    if chart_hint == "quality_overview":
+        if not isinstance(data, dict) or not data:
+            return findings
+        findings.append(f"总出院 {data.get('total_records', 0):,} 条 · "
+                        f"院内死亡 {data.get('deaths', 0):,} 人")
+        findings.append(f"死亡率 {data.get('mortality_rate', 0)}% / "
+                        f"平均住院 {data.get('avg_los', 0)} 天")
+        findings.append(f"急诊率 {data.get('ed_rate', 0)}% / "
+                        f"非医嘱离院率 {data.get('ama_rate', 0)}% / "
+                        f"转院率 {data.get('transfer_rate', 0)}%")
         return findings
 
     # —— 通用：data 是 list，按 chart_hint 取 Top3 ——
@@ -5333,9 +6358,9 @@ def generate_insight_report(single_result: dict = None, multi_results: list = No
             if isinstance(_intent, dict):
                 chart_hint = _intent.get("chart_hint")
 
-        # sankey 和 payment_summary 的 data 是 dict（不是 list），
+        # sankey / payment_summary / quality_overview 的 data 是 dict（不是 list），
         # 既不是空也不能按 list 走 Top3 逻辑，统一交给 _build_section_findings 处理
-        is_dict_data = chart_hint in ("sankey", "payment_summary")
+        is_dict_data = chart_hint in ("sankey", "payment_summary", "quality_overview")
         if (is_dict_data and not data) or (not is_dict_data and not data):
             continue
 
@@ -5420,9 +6445,70 @@ def generate_insight_report(single_result: dict = None, multi_results: list = No
 # ------------------------------------------------------------
 # 7. 主流程：自然语言 -> 分析结果（文字 + 图表配置 + 洞察报告）
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# 5.0 范围外判定（依赖 LangChain Agent，不再使用正则规则）
+# 平台定位：住院大数据分析，仅回答可映射到分析工具的数据查询。
+# 判定权完全交给 LangChain Agent：若本次问答 Agent 未选择 / 调用任何工具
+#（即它判断该问题无法映射到数据分析），则视为「非数据分析问题」，
+# 直接返回「暂不支持此服务」的优雅说明，完全不调用 P3，也不降级到旧 pipeline。
+# 相比正则规则，这种方式不会误伤正常数据查询（false positive），
+# 也消除了旧 pipeline 默认 dimension 造成的「答非所问」误路由。
+# ------------------------------------------------------------
+
+def _build_out_of_scope_result(question: str, agent_text: str = "") -> dict:
+    """Agent 未调用任何工具时构建「暂不支持此服务」结果。
+
+    - agent_text：Agent 自行生成的拒答文本（系统提示词已引导其礼貌拒答，优先采用更自然）；
+      为空或过短则回退到平台统一文案。
+    - 完全不调用 P3；返回结构化标记供前端区分「数据卡片」与「范围外卡片」。
+    """
+    suggestions = [
+        "2021 年呼吸道疾病住院量前 10",
+        "某疾病的住院费用趋势",
+        "不同年龄段 / 性别 / 地区的疾病分布",
+        "各类支付方式的占比与自付负担",
+        "医疗质量指标（死亡率、平均住院日、再入院风险）",
+    ]
+    if agent_text and len(agent_text.strip()) >= 8:
+        answer = agent_text.strip()
+    else:
+        answer = (
+            "🩺 您好，本平台是「智慧医疗大数据与 AI 大模型分析平台」，"
+            "聚焦于医院住院患者出院数据的统计与分析（疾病、手术、费用、支付方式、"
+            "医疗质量等多维度聚合）。\n\n"
+            "您的问题暂不在本平台服务范围内（本平台不提供疾病诊疗建议、用药指导、"
+            "个人健康咨询、医保政策或挂号流程等服务）。\n\n"
+            "💡 您可以把问题转化为「住院数据分析」类查询，例如：\n"
+            "1) 「2021 年呼吸道疾病住院量前 10」\n"
+            "2) 「某疾病的住院费用趋势」\n"
+            "3) 不同年龄段 / 性别 / 地区的疾病分布\n"
+            "4) 各类支付方式的占比与自付负担\n"
+            "5) 医疗质量指标（死亡率、平均住院日、再入院风险）"
+        )
+    intent = {
+        "_source": "out_of_scope",
+        "scope": "out_of_scope",
+        "scope_class": "langchain_no_tool",
+        "original_question": question,
+    }
+    return {
+        "question": question,
+        "intent": intent,
+        "answer": answer,
+        "chart": None,
+        "scope": "out_of_scope",   # 顶层标记，便于前端区分卡片类型
+        "meta": {
+            "out_of_scope": True,
+            "scope_class": "langchain_no_tool",
+            "suggestions": suggestions,
+        },
+    }
+
+
 def handle_question(question: str, with_report: bool | str = False,
                     conversation_id: str | None = None,
-                    use_llm_intent: bool = True) -> dict:
+                    use_llm_intent: bool = True,
+                    stream_callback=None) -> dict:
     """AI 智能交互完整闭环。
 
     with_report 支持三种形式：
@@ -5434,17 +6520,27 @@ def handle_question(question: str, with_report: bool | str = False,
     use_llm_intent=True 时，优先用 LangChain Agent（StructuredTool +
     create_tool_calling_agent）做意图识别 + 工具调用；Agent 不可用或失败时
     自动降级到旧 pipeline（parse_intent + call_analysis_api）
+    stream_callback：SSE 真流式回调——阶段事件 {"type":"stage","stage":...}
+    与摘要 token 事件 {"type":"token","data":piece}；None 为普通 /api/chat。
     """
     _obs_inc("requests_total")
     _t0 = time.time()
     _log_event("request_received", q_len=len(question),
                has_conv=bool(conversation_id))
+    _emit_stage(stream_callback, "routing")
+
+    # 0.5 范围外判定已下沉到 LangChain Agent 路径：
+    # _handle_question_via_agent 在「Agent 未选择任何工具」时直接返回
+    # 「暂不支持此服务」结果（不调用 P3、不降级旧 pipeline）。
+    # 因此这里不再做任何前置正则拦截，完全由 Agent 的 tool-calling 决策决定。
+
     # 0. 优先尝试 LangChain Agent 路径（StructuredTool + create_tool_calling_agent）
     path = "legacy"
     if use_llm_intent and _LANGCHAIN_AVAILABLE and LLM_ENABLED:
         agent_result = _handle_question_via_agent(
             question, with_report=with_report,
-            conversation_id=conversation_id)
+            conversation_id=conversation_id,
+            stream_callback=stream_callback)
         if agent_result is not None:
             path = "agent"
             _obs_inc("agent_path_total")
@@ -5473,6 +6569,7 @@ def handle_question(question: str, with_report: bool | str = False,
             with_report=with_report,
             conversation_id=conversation_id,
             history=history,
+            stream_callback=stream_callback,
         )
 
     _obs_nested_inc("intent_sources", result["intent"].get("_source", "unknown"))
@@ -5526,7 +6623,7 @@ def _async_report_ttl_sweep_locked(ratio: float = 0.2) -> int:
     return removed
 
 
-def _submit_async_report(api_result: dict, chart: dict) -> str:
+def _submit_async_report(api_result: dict, chart: dict, intent: dict = None) -> str:
     """提交一个异步报告任务，返回 report_id（用于 /api/report/status 查询）"""
     report_id = "rp_" + uuid.uuid4().hex
     now = time.time()
@@ -5567,6 +6664,7 @@ def _submit_async_report(api_result: dict, chart: dict) -> str:
             report = generate_insight_report(single_result={
                 "api_result": api_result,
                 "chart": chart,
+                "intent": intent,
             })
             with _ASYNC_REPORT_LOCK:
                 entry = ASYNC_REPORT_STORE.get(report_id)
@@ -5663,7 +6761,7 @@ def health():
             "langchain_agent": {
                 "available": _LANGCHAIN_AVAILABLE,
                 "tools_count": len(_TOOLS),
-                "mode": "create_tool_calling_agent" if _LANGCHAIN_AVAILABLE else "legacy_pipeline",
+                "mode": "native_tool_calling(bind_tools)" if _LANGCHAIN_AVAILABLE else "legacy_pipeline",
             },
             "cors_origins_count": len(CORS_ORIGINS),
             "flask_debug": FLASK_DEBUG,
@@ -5896,6 +6994,19 @@ def _sse_event(event: str, data) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _emit_stage(stream_callback, stage: str) -> None:
+    """向 SSE 流推一个阶段事件（routing/querying/summarizing/charting）。
+
+    前端据此显示"正在分析/查询/生成摘要/生成图表"等进度提示。
+    stream_callback 为 None 或回调抛异常时静默忽略（普通 /api/chat 与断连场景）。
+    """
+    if stream_callback:
+        try:
+            stream_callback({"type": "stage", "stage": stage})
+        except Exception:
+            pass
+
+
 def _sse_ping() -> str:
     """SSE 心跳注释行（以冒号开头的行是注释，客户端忽略），防代理/网关断连。"""
     return ": ping\n\n"
@@ -5905,10 +7016,13 @@ def _sse_ping() -> str:
 def chat_stream():
     """SSE 流式版主入口（请求体与 /api/chat 完全一致）。
 
-    事件流（text/event-stream）：
-      event: start   → data: {"question": ..., "ts": ...}   收到请求，立即推送
-      event: result  → data: {完整 result（同 /api/chat 成功响应）}
-      event: error   → data: {code, message, answer, ...}   校验失败 / 业务异常
+    事件流（text/event-stream）——SSE 真流式：
+      event: start      → data: {"question": ..., "ts": ...}  收到请求，立即推送
+      event: stage      → data: {"stage": "routing"|"querying"|"summarizing"|"charting"}
+                           阶段进度（前端可显示"正在分析/查询/生成摘要/生成图表"）
+      event: token      → data: {"text": "..."}              摘要 LLM 增量 token（逐段）
+      event: result     → data: {完整 result（同 /api/chat 成功响应）}
+      event: error      → data: {code, message, answer, ...} 校验失败 / 业务异常
       心跳：每 15s 一行 ": ping"（注释行），防连接被代理断开
 
     前端用法（fetch + ReadableStream 逐行解析，见 P4前端接口契约.md）：
@@ -5936,81 +7050,97 @@ def chat_stream():
             yield _sse_event("error", error_payload)
             return
 
-        # 2) 后台线程执行 handle_question（复用报告线程池），主生成器循环发心跳
-        future = _REPORT_EXECUTOR.submit(
-            handle_question, question,
-            with_report=with_report,
-            conversation_id=conversation_id,
-            use_llm_intent=use_llm_intent,
-        )
+        # 2) 后台线程执行 handle_question，通过队列实时转发 阶段/摘要 token 事件；
+        #    主生成器从队列取事件并 yield，空闲时发心跳保活（SSE 真流式）。
+        ev_queue = queue.Queue()
+
+        def runner():
+            try:
+                result = handle_question(
+                    question,
+                    with_report=with_report,
+                    conversation_id=conversation_id,
+                    use_llm_intent=use_llm_intent,
+                    stream_callback=ev_queue.put,  # {"type":"stage"|"token","data":...}
+                )
+                ev_queue.put({"type": "result", "data": result})
+            except requests.exceptions.Timeout as e:
+                ev_queue.put({"type": "error", "data": {
+                    "code": 504,
+                    "message": f"分析服务（P3）响应超时：{str(e)}，请稍后重试或简化查询条件",
+                    "question": question,
+                    "answer": "⏱️ 后端分析服务响应超时，可能是查询数据量过大或 P3 服务繁忙，请稍后重试。",
+                    "chart": None,
+                    "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+                }})
+            except requests.exceptions.ConnectionError as e:
+                ev_queue.put({"type": "error", "data": {
+                    "code": 502,
+                    "message": f"分析服务（P3）连接失败：{str(e)}",
+                    "question": question,
+                    "answer": "⚠️ 后端分析服务暂时连不上，请确认 P3 是否已启动。",
+                    "chart": None,
+                    "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+                }})
+            except requests.exceptions.RequestException as e:
+                ev_queue.put({"type": "error", "data": {
+                    "code": 502,
+                    "message": f"分析服务（P3）请求异常：{type(e).__name__}: {str(e)}",
+                    "question": question,
+                    "answer": "⚠️ 后端分析服务请求异常，请检查 P3 状态。",
+                    "chart": None,
+                    "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+                }})
+            except (KeyError, ValueError, TypeError) as e:
+                ev_queue.put({"type": "error", "data": {
+                    "code": 400,
+                    "message": f"无法解析您的问题或分析结果异常：{type(e).__name__}: {str(e)}",
+                    "question": question,
+                    "answer": "🤔 您的问题暂时无法解析或分析结果异常，建议换一种更明确的问法。",
+                    "chart": None,
+                    "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+                }})
+            except Exception as e:
+                logger.error("handle_question(SSE) 未预期异常：%s: %s",
+                             type(e).__name__, e, exc_info=True)
+                ev_queue.put({"type": "error", "data": {
+                    "code": 500,
+                    "message": f"分析失败：{type(e).__name__}: {str(e)}",
+                    "question": question,
+                    "answer": "⚠️ 抱歉，分析过程中出现异常，请检查日志或换个问题再试。",
+                    "chart": None,
+                    "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
+                }})
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
         last_beat = time.time()
-        while not future.done():
-            time.sleep(1)
-            if time.time() - last_beat >= 15:
-                yield _sse_ping()
-                last_beat = time.time()
-
-        try:
-            result = future.result()
-        except requests.exceptions.Timeout as e:
-            yield _sse_event("error", {
-                "code": 504,
-                "message": f"分析服务（P3）响应超时：{str(e)}，请稍后重试或简化查询条件",
-                "question": question,
-                "answer": "⏱️ 后端分析服务响应超时，可能是查询数据量过大或 P3 服务繁忙，请稍后重试。",
-                "chart": None,
-                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
-            })
-            return
-        except requests.exceptions.ConnectionError as e:
-            yield _sse_event("error", {
-                "code": 502,
-                "message": f"分析服务（P3）连接失败：{str(e)}",
-                "question": question,
-                "answer": "⚠️ 后端分析服务暂时连不上，请确认 P3 是否已启动。",
-                "chart": None,
-                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
-            })
-            return
-        except requests.exceptions.RequestException as e:
-            yield _sse_event("error", {
-                "code": 502,
-                "message": f"分析服务（P3）请求异常：{type(e).__name__}: {str(e)}",
-                "question": question,
-                "answer": "⚠️ 后端分析服务请求异常，请检查 P3 状态。",
-                "chart": None,
-                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
-            })
-            return
-        except (KeyError, ValueError, TypeError) as e:
-            yield _sse_event("error", {
-                "code": 400,
-                "message": f"无法解析您的问题或分析结果异常：{type(e).__name__}: {str(e)}",
-                "question": question,
-                "answer": "🤔 您的问题暂时无法解析或分析结果异常，建议换一种更明确的问法。",
-                "chart": None,
-                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
-            })
-            return
-        except Exception as e:
-            logger.error("handle_question(SSE) 未预期异常：%s: %s",
-                         type(e).__name__, e, exc_info=True)
-            yield _sse_event("error", {
-                "code": 500,
-                "message": f"分析失败：{type(e).__name__}: {str(e)}",
-                "question": question,
-                "answer": "⚠️ 抱歉，分析过程中出现异常，请检查日志或换个问题再试。",
-                "chart": None,
-                "meta": {"p4_total_ms": int((time.time() - t0) * 1000)},
-            })
-            return
-
-        # 3) 成功：补全 code/message/p4_total_ms 后推 result
-        result["code"] = 0
-        result["message"] = "success"
-        result["meta"] = dict(result.get("meta", {}))
-        result["meta"]["p4_total_ms"] = int((time.time() - t0) * 1000)
-        yield _sse_event("result", result)
+        while True:
+            try:
+                ev = ev_queue.get(timeout=1)
+            except queue.Empty:
+                if not t.is_alive():
+                    break  # 线程已结束且无待取事件（异常已在 runner 内入队）
+                if time.time() - last_beat >= 15:
+                    yield _sse_ping()
+                    last_beat = time.time()
+                continue
+            ev_type = ev.get("type")
+            if ev_type == "stage":
+                yield _sse_event("stage", {"stage": ev.get("stage")})
+            elif ev_type == "token":
+                yield _sse_event("token", {"text": ev.get("data", "")})
+            elif ev_type == "result":
+                result = ev["data"]
+                result["code"] = 0
+                result["message"] = "success"
+                result["meta"] = dict(result.get("meta", {}))
+                result["meta"]["p4_total_ms"] = int((time.time() - t0) * 1000)
+                yield _sse_event("result", result)
+                return
+            elif ev_type == "error":
+                yield _sse_event("error", ev["data"])
+                return
 
     return Response(
         stream_with_context(generate()),
@@ -6025,7 +7155,7 @@ def chat_stream():
 
 @app.route("/api/suggested-questions", methods=["GET"])
 def suggested_questions():
-    """P5 前端『推荐问题』数据源：覆盖全部 16 个分析工具，单一来源。
+    """P5 前端『推荐问题』数据源：覆盖全部 21 个分析工具，单一来源。
 
     返回按 category 分组的推荐问法，前端可用于『猜你想问』按钮。
     数据与 Agent 系统提示词 few-shot 共用 SUGGESTED_QUESTIONS，保证前后端一致。
@@ -6335,7 +7465,7 @@ if __name__ == "__main__":
                 logger.info("   LLM 小模型：%s", LLM_MODEL_ID_SMALL)
             logger.info("   LLM Base URL：%s", LLM_BASE_URL)
             # LangChain Agent 状态
-            agent_status = "✅ 已启用（16 个 StructuredTool + create_tool_calling_agent）" \
+            agent_status = "✅ 已启用（原生 tool-calling：ChatOpenAI.bind_tools，%d 个 StructuredTool）" % len(_TOOLS) \
                 if _LANGCHAIN_AVAILABLE else \
                 "⚠️ 未安装 langchain（pip install langchain langchain-openai），将使用旧 pipeline"
             logger.info("   LangChain Agent：%s", agent_status)
