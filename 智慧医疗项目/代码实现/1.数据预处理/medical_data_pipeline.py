@@ -38,6 +38,9 @@ import traceback
 from datetime import datetime
 from urllib.parse import quote_plus
 
+import numpy as np
+
+
 # 实时输出（后台任务重定向时刷新）
 class _Unbuffered:
     def __init__(self, s): self.s = s
@@ -689,7 +692,7 @@ def _pass2_build_fact(D, id_range):
         el = time.time() - t0
         spd = rows_done / max(el, 1)
         eta = (total_rows - rows_done) / max(spd, 1) / 60
-        print(f"  [{el/60:.1f}分] {rows_done:>10,}/{total_rows:,} ({rows_done/total*100:5.1f}%) "
+        print(f"  [{el/60:.1f}分] {rows_done:>10,}/{total_rows:,} ({rows_done/total_rows*100:5.1f}%) "
               f"{int(spd):>6,}/s 剩余{eta:.1f}分 失败{fails:,}", flush=True)
         pos = end + 1
 
