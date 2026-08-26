@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>详情页 - 智慧医疗</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; padding: 40px; background: #f5f7fa; }
+    h1 { color: #4A90D9; }
+    .back { margin-top: 30px; display: inline-block; padding: 10px 20px; background: #4A90D9; color: white; text-decoration: none; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>📋 疾病详情页</h1>
+  <p>这里是点击图表后进入的详情子页面。</p>
+  <p><strong>当前参数：</strong><span id="param">未获取</span></p>
+  <a href="/" class="back">← 返回大屏</a>
+
+  <script>
+    // 从 URL 获取参数（比如 ?disease=心血管）
+    const params = new URLSearchParams(window.location.search);
+    document.getElementById('param').textContent = params.get('disease') || '所有疾病';
+  </script>
+</body>
+</html>

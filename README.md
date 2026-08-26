@@ -1,288 +1,133 @@
-# 智慧医疗数据分析平台 - 数据分析服务
+# 智慧医疗大数据与 AI 大模型分析平台
 
-基于FastAPI的医疗数据分析后端服务，支持多维度数据分析和DRG分析。
+基于 **Vue3 + ECharts + Flask/FastAPI + MySQL** 的医疗数据分析平台，覆盖成本、病种、支付、质量、急诊、DRG 等维度，并内置 AI 大模型智能问答助手。数据规模 **1038 万行住院记录（2020–2024）**，前端图表已做持久化预聚合优化，秒级加载。
 
-## 功能特性
+## 功能模块
 
-### DRG分析功能（主要）
-
-| 功能 | API接口 | 说明 |
-|------|---------|------|
-| DRG费用排名 | `POST /api/v1/drg/cost-ranking` | 按DRG分组统计费用排名 |
-| 住院天数对比 | `POST /api/v1/drg/stay-comparison` | 按DRG/诊断/严重程度分组对比 |
-| 死亡风险对比 | `POST /api/v1/drg/mortality-risk` | 按风险等级统计分析 |
-| CMI排名 | `POST /api/v1/drg/cmi-ranking` | 病例组合指数排名 |
-| 离群识别 | `POST /api/v1/drg/outlier-detection` | 费用/住院天数异常检测 |
-
-### 核心分析功能（底层）
-
-| 功能 | API接口 | 说明 |
-|------|---------|------|
-| 维度组合选择 | `POST /api/v1/analysis/dimension-combine` | 任意维度组合分析 |
-| 指标切换 | `POST /api/v1/analysis/metric-switch` | 多指标组切换 |
-| 逐级下钻 | `POST /api/v1/analysis/drill-down` | 层次化下钻查询 |
-| 时间上卷 | `POST /api/v1/analysis/time-rollup` | 时间维度聚合 |
-| 交叉透视 | `POST /api/v1/analysis/pivot` | 多维度交叉分析 |
+- **数据大屏（Dashboard / 3D 大屏）**：六维图表总览 + WebGL 3D 地图大屏
+- **成本分析**：费用成本差 / 利润率 / 效率评级 / 费用构成 / 趋势
+- **病种分析**：TOP 诊断 / 手术、严重程度构成、人群差异、年龄金字塔、地区差异、热力图
+- **支付分析**：支付结构、交叉、桑基图、费用关系、自付负担、汇总
+- **质量监测**：KPI 总览、死亡率排行、住院日排行、医院质量对比、离院去向
+- **急诊分析**：急诊率趋势、急诊对比、平均住院日、超标识别、转归交叉
+- **DRG 分析**：费用排名、住院天数对比、死亡风险、CMI 排名、离群识别
+- **AI 智能问答**：自然语言提问，自动路由到对应分析端点并生成图表/报告
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
-| 数据处理 | Python 3.11 / Pandas / NumPy / PyMySQL |
-| 分析服务 | Flask（RESTful API）/ Redis（二期缓存） |
-| AI 交互 | LangChain / LLM（云端或本地 Qwen、BaiChuan） |
-| 前端 | Vue 3 + ECharts |
-| 存储 | MySQL 8.0（星型模式，1 事实表 + 4 维度表） |
-| 大数据（二期） | Hadoop / Spark 3.5 / Hive |
+| 前端 | Vue 3 · Vue Router · ECharts / echarts-gl · Vite · Axios |
+| 后端 | Flask（P3 分析）· FastAPI（core / DRG）· PyMySQL |
+| 数据 | MySQL 8.0 · 星型模型（fact_discharge + 7 维度表） |
+| AI | 大模型（OpenAI 兼容接口）· 工具调用 / function-calling |
+
+## 架构与端口
+
+```
+前端 Vite (5173) ──代理──> Flask 分析服务 P3 (5000)   # 病种/支付/质量/成本/急诊
+                       ├──> FastAPI 核心分析  (8000)   # 动态下钻 / 元数据
+                       ├──> FastAPI DRG 分析  (8001)   # DRG 分析
+                       └──> AI agent P4       (5001)   # 智能问答
+```
+
+| 服务 | 端口 | 启动命令（见 `start.sh`） |
+|---|---|---|
+| Flask 分析服务 P3 | 5000 | `python3.11 app.py` |
+| FastAPI 核心分析 | 8000 | `uvicorn modules.core.main:app --port 8000` |
+| FastAPI DRG 分析 | 8001 | `uvicorn modules.drg.main:app --port 8001` |
+| AI 交互 agent P4 | 5001 | `python3.11 agent.py` |
+| 前端 Vite | 5173 | `npm run dev` |
 
 ## 目录结构
 
 ```
-智慧医疗/
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── 智慧医疗大数据与AI大模型分析平台_项目企划书.md / .docx
-└── 智慧医疗项目/
-    ├── 代码实现/
-    │   ├── 1. 数据预处理/   # 数据清洗、标准化、去重、批量入库
-    │   ├── 2. 分析服务/     # 多维聚合分析 + RESTful API
-    │   ├── 3. AI交互/       # LangChain Agent（意图识别 → 工具调用 → 文本生成）
-    │   └── 4. 前端/         # Vue3 + ECharts 可视化
-    ├── 接口文档/            # RESTful API 接口文档
-    ├── 任务清单/            # 5 人详细任务分工
-    ├── 数据库设计/          # schema.sql + ER 图与设计说明
-    └── 项目计划/            # 项目计划书 + CMMI/RUP 过程文档模板
+├── start.sh / stop.sh / open.sh   # 一键启停 + 访问地址
+├── backend/
+│   ├── requirements.txt           # 后端统一依赖
+│   ├── README.md / DATABASE.md    # 后端说明 / 数据库设计
+│   └── 智慧医疗项目/
+│       ├── 代码实现/
+│       │   ├── 1.数据预处理/       # 数据 ETL
+│       │   ├── 2.分析服务/         # P3 Flask + core/drg FastAPI + 各分析模块
+│       │   └── 3.AI交互/           # P4 AI agent + .env.example 模板
+│       └── 接口文档/               # 接口契约文档
+├── frontend/
+│   └── medical-frontend/          # Vue3 前端（node_modules 需 npm install）
+└── database/                      # 建表 / 回填 / 索引 / 预热脚本（含 README）
 ```
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 准备数据库
+
+数据库为 MySQL 8.0（本机 `/opt/mysql`，socket `/opt/mysql/mysql.sock`，root 空密码）。
+若需从零重建，见 [`database/README.md`](database/README.md) 的脚本执行顺序。
+
+### 2. 安装依赖
 
 ```bash
-pip install -r requirements.txt
+# 后端
+pip install -r backend/requirements.txt
+
+# 前端
+cd frontend/medical-frontend && npm install && cd ../..
 ```
 
-### 2. 配置数据库
-
-编辑 `.env` 文件，配置MySQL连接信息：
-
-```env
-MYSQL_HOST=localhost
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=123456
-MYSQL_DATABASE=medical_db
-```
-
-### 3. 导入数据
+### 3. 配置环境变量（AI agent 需要）
 
 ```bash
-mysql -u root -p medical_db < star_schema_dump.sql
+cp backend/智慧医疗项目/代码实现/3.AI交互/.env.example \
+   backend/智慧医疗项目/代码实现/3.AI交互/.env
+# 编辑 .env，填入 LLM_API_KEY / LLM_BASE_URL 等
 ```
 
-### 4. 启动服务
+### 4. 启动
 
 ```bash
-python -m src.main
+bash start.sh     # 一键启动全部服务（含后台缓存预热）
+bash open.sh      # 查看访问地址
+bash stop.sh      # 停止全部服务
 ```
 
-服务将在 http://localhost:8000 启动。
+前端访问 `http://localhost:5173`；core/drg 接口文档分别在 `:8000/docs`、`:8001/docs`。
 
-### 5. 访问API文档
+## 数据库
 
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+| 库 | 表 | 规模 |
+|---|---|---|
+| `medical_db` | fact_discharge + 7 维度表 | 10,378,775 行（2020–2024） |
+| `smart_health` | fact_inpatient_discharge + 4 维度表 | 约 200 万行（2021，旧库） |
 
-## API接口详情
+> 事实表数据 dump（约 977MB）未随仓库提交（live 库已含数据），见 `database/README.md`。
 
-### DRG分析接口
+## 性能优化（要点）
 
-#### 1. DRG费用排名
+针对 16.5GB 大表的图表查询做了持久化预聚合优化，冷查询从 10~130s 降到秒级：
 
-```http
-POST /api/v1/drg/cost-ranking
+- **持久化预聚合层** `medical_db.api_cache`：结果落盘 MySQL，跨重启存活，不依赖 Redis；
+  由 `start.sh` 后台自动预热（`WARM_CACHE=0` 可跳过）。
+- **覆盖索引**：为含 `length_of_stay` 的聚合补宽覆盖索引，避免千万次主键回表。
+- **反规范化**：把维度列回填到事实表，消除大表 JOIN。
+- **DRG 两级聚合**：先按外键 GROUP BY，再 JOIN 小维度表取名。
+
+详细脚本与踩坑记录见 [`database/README.md`](database/README.md)。
+
+### 缓存失效
+
+数据为 2020–2024 静态快照，缓存不过期。重新导入数据后：
+
+```bash
+/opt/mysql/bin/mysql --socket=/opt/mysql/mysql.sock -u root medical_db -e "TRUNCATE api_cache;"
+python3.11 database/warm_cache.py
 ```
 
-**请求示例：**
-```json
-{
-    "metrics": ["cases", "total_charges", "avg_charges"],
-    "limit": 20,
-    "sort_order": "desc"
-}
-```
+## 安全说明
 
-**响应示例：**
-```json
-{
-    "code": 200,
-    "message": "success",
-    "data": {
-        "title": "DRG费用排名",
-        "columns": ["drg_code", "drg_desc", "cases", "total_charges", "avg_charges"],
-        "rows": [...],
-        "total": 20
-    }
-}
-```
+- 所有真实密钥（`LLM_API_KEY` 等）仅在本地 `.env` / `.env.production` 中，**已通过
+  `.gitignore` 排除**，仓库只提供 `.env.example` 模板。
+- `node_modules/`、`__pycache__/`、日志、大 dump 等均不入库。
 
-#### 2. 住院天数对比
+## License
 
-```http
-POST /api/v1/drg/stay-comparison
-```
-
-**请求示例：**
-```json
-{
-    "group_by": "drg",
-    "metrics": ["avg_stay", "max_stay", "cases"],
-    "limit": 20
-}
-```
-
-**可选分组维度：** `drg`, `diagnosis`, `severity`, `mdc`
-
-#### 3. 死亡风险对比
-
-```http
-POST /api/v1/drg/mortality-risk
-```
-
-**请求示例：**
-```json
-{
-    "group_by": "risk_mortality",
-    "metrics": ["cases", "avg_charges", "avg_stay"]
-}
-```
-
-**可选分组维度：** `risk_mortality`, `severity`, `mdc`, `drg`
-
-#### 4. CMI排名
-
-```http
-POST /api/v1/drg/cmi-ranking
-```
-
-**请求示例：**
-```json
-{
-    "group_by": "drg",
-    "limit": 20,
-    "sort_order": "desc"
-}
-```
-
-**可选分组维度：** `drg`, `mdc`, `hospital`
-
-#### 5. 离群识别
-
-```http
-POST /api/v1/drg/outlier-detection
-```
-
-**请求示例：**
-```json
-{
-    "metric": "avg_charges",
-    "group_by": "drg",
-    "method": "iqr",
-    "threshold": 1.5,
-    "limit": 50
-}
-```
-
-**可选参数：**
-- `metric`: `avg_charges`, `avg_stay`, `cases`
-- `group_by`: `drg`, `diagnosis`, `hospital`
-- `method`: `iqr`, `zscore`
-
-#### 6. DRG汇总信息
-
-```http
-GET /api/v1/drg/summary
-```
-
-#### 7. 健康检查
-
-```http
-GET /api/v1/drg/health
-```
-
-## 可用维度
-
-| 维度名称 | 说明 |
-|----------|------|
-| hospital_name | 医院名称 |
-| hospital_area | 服务区 |
-| hospital_county | 所在县 |
-| age_group | 年龄段 |
-| gender | 性别 |
-| race | 种族 |
-| diagnosis_code | 诊断编码 |
-| diagnosis_desc | 诊断描述 |
-| drg_code | DRG编码 |
-| drg_desc | DRG描述 |
-| mdc_code | MDC编码 |
-| mdc_desc | MDC描述 |
-| severity_code | 严重程度编码 |
-| severity_desc | 严重程度描述 |
-| risk_mortality | 死亡风险 |
-| medical_surgical | 内外科 |
-| payment_type | 支付方式 |
-| year | 年份 |
-
-## 可用指标
-
-| 指标名称 | 说明 |
-|----------|------|
-| cases | 病例数 |
-| total_charges | 总费用 |
-| avg_charges | 平均费用 |
-| total_costs | 总成本 |
-| avg_costs | 平均成本 |
-| total_stay | 总住院天数 |
-| avg_stay | 平均住院天数 |
-| max_stay | 最大住院天数 |
-| min_stay | 最小住院天数 |
-| cost_ratio | 成本收益率 |
-| charges_per_day | 日均费用 |
-
-## 响应格式
-
-所有接口返回统一格式：
-
-```json
-{
-    "code": 200,
-    "message": "success",
-    "data": {
-        "columns": [...],
-        "rows": [...],
-        "total": 100
-    }
-}
-```
-
-## 开发团队
-
-| 成员 | 职责 |
-|------|------|
-| 万方 | 框架搭建、数据存储、集成测试 |
-| 骆志远 | 数据预处理、后端功能开发 |
-| 白子涵 | 数据分析、DRG功能、后端功能开发 |
-| 纪志鹏 | 大模型、API调用、后端功能开发 |
-| 高清源 | 前端页面设计、接口对接 |
-
-## 开发计划
-
-- [x] 阶段1：数据层建设
-- [x] 阶段2：核心分析功能
-- [x] 阶段3：DRG分析功能
-- [ ] 阶段4：优化与测试
-
-## 许可证
-
-MIT License
+教育 / 课程项目，保留所有权利。

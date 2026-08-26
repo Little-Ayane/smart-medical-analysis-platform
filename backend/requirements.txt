@@ -1,0 +1,22 @@
+# ============================================================
+# 智慧医疗平台 · 后端运行时依赖（全服务统一）
+#   Flask 分析服务(5000) + core/drg FastAPI(8000/8001) + AI agent(5001)
+# 安装：pip install -r requirements.txt
+# ============================================================
+
+# Web 框架
+flask>=3.0
+flask-cors>=4.0
+fastapi>=0.104.1
+uvicorn>=0.24.0
+
+# 数据库 / 缓存
+pymysql>=1.0
+redis>=5.0
+
+# 数据校验 / 配置
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+
+# HTTP 客户端（AI agent 调用分析服务）
+requests>=2.31
